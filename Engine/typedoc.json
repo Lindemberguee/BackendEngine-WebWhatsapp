@@ -1,0 +1,22 @@
+{
+    "$schema": "https://typedoc.org/schema.json",
+    "entryPoints": [
+        "./lib/index.d.ts"
+    ],
+    "out": "./docs",
+    "plugin": [
+        "typedoc-plugin-markdown"
+    ],
+    "readme": "./README.md",
+    "includeVersion": true,
+    "entryPointStrategy": "expand",
+    "excludeExternals": true,
+    "excludePrivate": true,
+    "excludeProtected": false,
+    "skipErrorChecking": true,
+    "validation": {
+        "notExported": false,
+        "invalidLink": false,
+        "notDocumented": false
+    }
+}

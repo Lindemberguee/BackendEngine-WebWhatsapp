@@ -1,0 +1,23 @@
+{
+  "name": "wa-proto",
+  "version": "1.0.0",
+  "description": "Protobuf files from WhatsApp WEB",
+  "main": "proto/index.js",
+  "files": [
+    "proto/*"
+  ],
+  "scripts": {
+    "build": "npm run fetch && npm run generate",
+    "fetch": "node index.js",
+    "generate": "node generate-proto.js"
+  },
+  "dependencies": {
+    "long": "latest",
+    "protobufjs": "latest"
+  },
+  "devDependencies": {
+    "acorn": "latest",
+    "acorn-walk": "latest",
+    "protobufjs-cli": "latest"
+  }
+}

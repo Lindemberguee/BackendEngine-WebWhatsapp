@@ -1,0 +1,59 @@
+version: '3.9'
+
+services:
+  mongodb:
+    image: mongo:7
+    container_name: webwhatsapp-mongo
+    restart: unless-stopped
+    ports:
+      - '27017:27017'
+    environment:
+      MONGO_INITDB_DATABASE: webwhatsapp
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ['CMD', 'mongosh', '--eval', "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mongo-express:
+    image: mongo-express:1
+    container_name: webwhatsapp-mongo-ui
+    restart: unless-stopped
+    ports:
+      - '8081:8081'
+    environment:
+      ME_CONFIG_MONGODB_SERVER: mongodb
+      ME_CONFIG_BASICAUTH_USERNAME: admin
+      ME_CONFIG_BASICAUTH_PASSWORD: admin123
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    profiles: ['dev']
+
+  # Production-shaped build of the API. Build context is the workspace root
+  # (`..`, i.e. E:\Baileys) because @webwhatsapp/engine is a sibling npm
+  # workspace, not a published package — see Dockerfile for details.
+  backend:
+    build:
+      context: ..
+      dockerfile: Backend/Dockerfile
+    container_name: webwhatsapp-backend
+    restart: unless-stopped
+    ports:
+      - '3333:3333'
+    environment:
+      NODE_ENV: production
+      PORT: 3333
+      HOST: 0.0.0.0
+      MONGODB_URI: mongodb://mongodb:27017/webwhatsapp
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env before running in production}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3000}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    depends_on:
+      mongodb:
+        condition: service_healthy
+
+volumes:
+  mongo_data:

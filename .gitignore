@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+
+# Environment secrets — never commit real credentials, only .env.example
+.env
+.env.local
+.env.*.local
+
+# WhatsApp session/auth state — these are live device credentials, not code
+Engine/auth/
+**/auth_info*/
+
+# Logs
+*.log
+Engine/baileys-debug.log
+Engine/baileys-log.json
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Package manager lockfile noise (keep package-lock.json, ignore optional alt managers)
+.npm-cache/

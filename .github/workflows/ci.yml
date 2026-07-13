@@ -1,0 +1,40 @@
+name: Backend CI
+
+# Lives at the workspace root (not inside Backend/) because @webwhatsapp/engine
+# is a local npm workspace ("file:../Engine") — `npm ci` needs both Engine/
+# and Backend/ present, which only works if git checks out this whole
+# directory. If Backend ends up in its own separate git repo instead of here,
+# this workflow (and the Dockerfile) need Engine fetched as a second step.
+
+on:
+  push:
+    branches: [main]
+    paths: ['Backend/**', 'Engine/**']
+  pull_request:
+    branches: [main]
+    paths: ['Backend/**', 'Engine/**']
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci --workspaces --include-workspace-root
+
+      - name: Typecheck
+        working-directory: Backend
+        run: npx tsc --noEmit
+
+      - name: Lint
+        working-directory: Backend
+        run: npm run lint
+
+      - name: Build
+        working-directory: Backend
+        run: npm run build

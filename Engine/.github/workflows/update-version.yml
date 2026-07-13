@@ -1,0 +1,78 @@
+name: Update WhatsApp Version
+
+on:
+  schedule:
+    # Run every Sunday at 03:00 UTC
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Node
+        uses: actions/setup-node@v3.6.0
+        with:
+          node-version: 20.x
+          cache: 'yarn'
+
+      - name: Install packages
+        run: yarn install
+
+      - name: Update WhatsApp Web Version
+        id: update_version
+        run: yarn update:version
+
+      - name: Check for changes
+        id: check_changes
+        run: |
+          if git diff --quiet; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Pull Request and Auto-Merge
+        if: steps.check_changes.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TEMP_BRANCH="update-version/automation"
+          BASE_BRANCH="main"
+
+          # Configure git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Delete remote branch if it exists to start fresh
+          git push origin --delete "$TEMP_BRANCH" 2>/dev/null || true
+
+          # Create new branch, commit, and push
+          git checkout -b "$TEMP_BRANCH"
+          git add .
+          git commit -m "chore: update WhatsApp Web version"
+          git push origin "$TEMP_BRANCH"
+
+          # Create PR and capture the URL
+          PR_URL=$(gh pr create \
+            --title "chore: update WhatsApp Web version" \
+            --body "Automated WhatsApp Web version update." \
+            --base "$BASE_BRANCH" \
+            --head "$TEMP_BRANCH")
+
+          if [ -n "$PR_URL" ]; then
+            echo "PR Created: $PR_URL"
+            # Auto-merge the PR
+            gh pr merge "$PR_URL" --merge --delete-branch
+            echo "PR Merged successfully!"
+          else
+            echo "PR could not be created or already exists"
+          fi
