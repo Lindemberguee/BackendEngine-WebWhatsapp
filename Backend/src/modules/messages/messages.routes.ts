@@ -121,8 +121,10 @@ export async function messagesRoutes(fastify: FastifyInstance, opts: { sessionMa
       }
 
       const options: Record<string, unknown> = {};
-      if (body.quotedMessageId) {
-        const quoted = await Message.findOne({ messageId: body.quotedMessageId, conversationId }).lean();
+      // quotedMessageId is our Mongo _id (see chat.api.ts toMessage()), not WhatsApp's own key.id —
+      // querying by the wrong field silently dropped every reply-quote before it reached Baileys.
+      if (body.quotedMessageId && Types.ObjectId.isValid(body.quotedMessageId)) {
+        const quoted = await Message.findOne({ _id: body.quotedMessageId, conversationId }).lean();
         if (quoted?.rawPayload) options.quoted = { key: { id: quoted.messageId, remoteJid: conv.jid }, message: quoted.rawPayload };
       }
 
@@ -213,8 +215,9 @@ export async function messagesRoutes(fastify: FastifyInstance, opts: { sessionMa
       else baileysContent = { document: buffer, mimetype: fileMime, fileName, caption };
 
       const options: Record<string, unknown> = {};
-      if (fields.quotedMessageId) {
-        const quoted = await Message.findOne({ messageId: fields.quotedMessageId, conversationId }).lean();
+      // Same fix as the text-send route above — quotedMessageId is our Mongo _id, not WhatsApp's key.id.
+      if (fields.quotedMessageId && Types.ObjectId.isValid(fields.quotedMessageId)) {
+        const quoted = await Message.findOne({ _id: fields.quotedMessageId, conversationId }).lean();
         if (quoted?.rawPayload) options.quoted = { key: { id: quoted.messageId, remoteJid: conv.jid }, message: quoted.rawPayload };
       }
 
