@@ -1727,9 +1727,13 @@ const makeMessagesRecvSocket = (config) => {
     /// processes a node with the given function
     /// and adds the task to the existing buffer if we're buffering events
     const processNodeWithBuffer = async (node, identifier, exec) => {
-        ev.buffer()
-        await execTask()
-        ev.flush()
+        try {
+            ev.buffer()
+            await execTask()
+            ev.flush()
+        } catch (err) {
+            onUnexpectedError(err, identifier)
+        }
         function execTask() {
             return exec(node, false)
                 .catch(err => onUnexpectedError(err, identifier))
@@ -1767,7 +1771,19 @@ const makeMessagesRecvSocket = (config) => {
                             onUnexpectedError(new Error(`unknown offline node type: ${type}`), 'processing offline node')
                             continue
                         }
-                        await nodeProcessor(node)
+                        // The socket can close mid-batch (e.g. the user logs out from
+                        // their phone while a backlog of offline nodes is still being
+                        // processed) — a node processor that tries to ack/reply on a
+                        // dead socket throws, and left uncaught here that becomes an
+                        // unhandled rejection that crashes the whole process. Mirrors
+                        // the same safety net processNodeWithBuffer already uses for
+                        // the live/online path.
+                        try {
+                            await nodeProcessor(node)
+                        }
+                        catch (err) {
+                            onUnexpectedError(err, 'processing offline node')
+                        }
                     }
                     if (nodes.length > 0) {
                         await Utils_1.delay(0)
@@ -1789,6 +1805,7 @@ const makeMessagesRecvSocket = (config) => {
 
         if (isOffline) {
             offlineNodeProcessor.enqueue(type, node)
+                .catch(err => onUnexpectedError(err, 'enqueueing offline node'))
         }
 
         else {
@@ -1862,6 +1879,7 @@ const makeMessagesRecvSocket = (config) => {
 
             const protoMsg = WAProto_1.proto.WebMessageInfo.fromObject(msg)
             upsertMessage(protoMsg, call.offline ? 'append' : 'notify')
+                .catch(err => onUnexpectedError(err, 'upserting call message'))
         }
     })
 

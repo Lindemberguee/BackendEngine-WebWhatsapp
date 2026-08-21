@@ -9,23 +9,20 @@ import makeWASocket, {
 } from '@webwhatsapp/engine';
 import { Boom } from '@hapi/boom';
 import pino from 'pino';
-import { Types } from 'mongoose';
 import { useMongoAuthState } from './MongoAuthState';
 import { Instance, Conversation, Message, Contact } from '../db/models';
 import type { WebSocketGateway } from '../ws/gateway';
-import { extractMessageContent, parseJid, extractMediaMetadata, extractPreview, lastMessagePreview } from '../utils/message.utils';
-import { handleInboundForFlows } from '../flow-executor';
+import { extractMessageContent, parseJid, extractMediaMetadata, extractPreview } from '../utils/message.utils';
 import { inspectMediaMessage } from '../utils/media-inspector';
-import { maybeAutoCreateLeadFromConversation } from '../modules/crm/crm.service';
-import { notify, notifyWorkspaceOwner } from '../modules/notifications/notification.service';
-import { backfillRecipientDeliveryStatus, handleCampaignReply } from '../modules/campaigns/campaign.service';
-import { getAutoRouteMode, routeConversation } from '../modules/routing/routing.service';
-import { applySlaTimers } from '../modules/routing/sla.service';
-import { emitWebhookEvent } from '../modules/webhooks/webhook.service';
+import { notifyWorkspaceOwner } from '../modules/notifications/notification.service';
+import { backfillRecipientDeliveryStatus } from '../modules/campaigns/campaign.service';
+import { ingestInboundMessage } from '../messaging/ingest-inbound';
+import { toBaileys } from '../channels/baileys/to-baileys';
+import type { OutboundMessage } from '../messaging/outbound-types';
+import type { IChannelSession } from '../channels/types';
+import { archiveMessageMedia } from '../shared/media-storage';
 
 const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' });
-
-const OPT_OUT_KEYWORDS = new Set(['parar', 'sair', 'stop', 'cancelar', 'unsubscribe']);
 
 /**
  * Strip the device/agent suffix from a JID so the same user coming from a linked
@@ -44,7 +41,9 @@ export type SessionEvent =
   | { type: 'message'; instanceId: string; workspaceId: string; message: Record<string, unknown> }
   | { type: 'presence'; instanceId: string; workspaceId: string; jid: string; presence: string };
 
-export class BaileysSession {
+export class BaileysSession implements IChannelSession {
+  readonly channel = 'baileys' as const;
+  private static readonly MAX_RECONNECT_ATTEMPTS = 10;
   private sock?: WASocket;
   private reconnectAttempts = 0;
   private destroyed = false;
@@ -54,15 +53,35 @@ export class BaileysSession {
 
   constructor(
     public readonly instanceId: string,
-    private readonly wsGateway: WebSocketGateway
+    private readonly wsGateway: WebSocketGateway,
+    /** Called when WhatsApp itself ends the session (phone-side logout) — lets
+     *  SessionManager evict this instance from its map even when nobody called
+     *  logoutSession() explicitly, so a later re-pair doesn't hit a corpse. */
+    private readonly onLoggedOut?: () => void
   ) {}
 
   async connect(): Promise<void> {
+    // Guard against overlapping connect() calls — a pending reconnect timer
+    // firing while another connect() is already in flight (or a manual restart
+    // racing a reconnect) would otherwise leave two live sockets both wired to
+    // `this`, both writing instance status and both scheduling their own
+    // reconnects (a reconnect storm). Tear down any previous socket first.
+    if (this.sock) {
+      const staleSock = this.sock;
+      this.sock = undefined;
+      // end() already tears down the engine's own listeners/timers/noise state
+      // internally (see socket.js's end()) — no need to duplicate that here.
+      try { staleSock.end(undefined); } catch { /* best-effort */ }
+    }
+
     const instanceDoc = await Instance.findById(this.instanceId);
     if (!instanceDoc) throw new Error(`Instance ${this.instanceId} not found`);
     this.workspaceId = instanceDoc.workspaceId.toString();
 
-    await Instance.findByIdAndUpdate(this.instanceId, { status: 'connecting', errorMessage: undefined });
+    // `$set: { errorMessage: undefined }` is silently dropped by the Mongo driver —
+    // it does NOT clear the field, so a stale error from a previous failed attempt
+    // stuck around forever once one occurred. Needs an actual $unset.
+    await Instance.findByIdAndUpdate(this.instanceId, { $set: { status: 'connecting' }, $unset: { errorMessage: 1 } });
     this.wsGateway.broadcastInstanceStatus(this.workspaceId, this.instanceId, 'connecting');
 
     const { state, saveCreds } = await useMongoAuthState(this.instanceId);
@@ -80,6 +99,7 @@ export class BaileysSession {
 
     // ── Connection state ────────────────────────────────────────────────────
     this.sock.ev.on('connection.update', async (update) => {
+      try {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
@@ -93,13 +113,12 @@ export class BaileysSession {
         this.reconnectAttempts = 0;
         this.connected = true;
         const phone = this.sock?.user?.id?.split(':')[0] ?? undefined;
+        // Same undefined-doesn't-clear pitfall — the old QR/pairing code and any
+        // stale error message never actually left the document, and kept being
+        // returned by GET /api/instances for an instance that's now connected.
         await Instance.findByIdAndUpdate(this.instanceId, {
-          status: 'connected',
-          qrCode: undefined,
-          pairingCode: undefined,
-          errorMessage: undefined,
-          lastConnectedAt: new Date(),
-          phone,
+          $set: { status: 'connected', lastConnectedAt: new Date(), phone },
+          $unset: { qrCode: 1, pairingCode: 1, errorMessage: 1 },
         });
         this.wsGateway.broadcastInstanceStatus(this.workspaceId, this.instanceId, 'connected', { phone });
         logger.info({ instanceId: this.instanceId, phone }, 'Instance connected');
@@ -114,25 +133,65 @@ export class BaileysSession {
         this.connected = false;
         const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
         const loggedOut = statusCode === DisconnectReason.loggedOut;
+        // forbidden (403, number banned/blocked by WhatsApp) and connectionReplaced
+        // (440, another web session took over) are explicitly documented as
+        // "don't reconnect" cases — retrying just hammers WhatsApp's servers every
+        // 30s forever and can make a ban worse. badSession (500) means the stored
+        // auth state itself is corrupt; reconnecting with the same broken creds
+        // just repeats the same failure indefinitely. All three need a human to
+        // act (re-scan a fresh QR / contact support), not an infinite retry loop.
+        const terminalCode = statusCode === DisconnectReason.forbidden
+          || statusCode === DisconnectReason.connectionReplaced
+          || statusCode === DisconnectReason.badSession;
+        const isBanned = statusCode === DisconnectReason.forbidden;
 
-        await Instance.findByIdAndUpdate(this.instanceId, {
-          status: loggedOut ? 'disconnected' : 'error',
-          lastDisconnectedAt: new Date(),
-          errorMessage: loggedOut ? undefined : String(lastDisconnect?.error ?? 'Unknown error'),
-        });
-        this.wsGateway.broadcastInstanceStatus(this.workspaceId, this.instanceId, loggedOut ? 'disconnected' : 'error');
+        const status = loggedOut ? 'disconnected' : isBanned ? 'banned' : 'error';
+        // Same undefined-doesn't-clear pitfall as above: on a clean logout the old
+        // errorMessage from a previous failed attempt needs an actual $unset, or it
+        // stays displayed even though the instance is now just cleanly disconnected.
+        await Instance.findByIdAndUpdate(this.instanceId, loggedOut
+          ? { $set: { status, lastDisconnectedAt: new Date() }, $unset: { errorMessage: 1 } }
+          : { $set: { status, lastDisconnectedAt: new Date(), errorMessage: String(lastDisconnect?.error ?? 'Unknown error') } });
+        this.wsGateway.broadcastInstanceStatus(this.workspaceId, this.instanceId, status);
         notifyWorkspaceOwner(this.wsGateway, this.workspaceId, {
           type: 'instance.disconnected', title: 'WhatsApp desconectado',
-          message: loggedOut ? 'A instância foi desconectada (logout no aparelho).' : 'A instância caiu por um erro de conexão.',
+          message: loggedOut
+            ? 'A instância foi desconectada (logout no aparelho).'
+            : isBanned
+            ? 'O número foi bloqueado pelo WhatsApp.'
+            : terminalCode
+            ? 'A instância caiu e precisa ser reconectada manualmente.'
+            : 'A instância caiu por um erro de conexão.',
           link: '/instances', metadata: { instanceId: this.instanceId },
         }).catch(() => {});
 
-        if (!loggedOut && !this.destroyed) {
+        if (loggedOut || terminalCode) {
+          this.destroyed = true;
+          if (loggedOut) this.onLoggedOut?.();
+        } else if (!this.destroyed) {
           this.reconnectAttempts++;
+          // Cap the backoff loop too — a transient-looking failure that's still
+          // failing after 10 attempts (~5 min of backoff) is no longer transient;
+          // stop hammering and let the user retry manually instead of looping forever.
+          if (this.reconnectAttempts > BaileysSession.MAX_RECONNECT_ATTEMPTS) {
+            logger.error({ instanceId: this.instanceId }, 'Giving up reconnect after max attempts');
+            this.destroyed = true;
+            return;
+          }
           const delay = Math.min(3000 * this.reconnectAttempts, 30_000);
           logger.warn({ instanceId: this.instanceId, attempt: this.reconnectAttempts, delay }, 'Reconnecting...');
-          setTimeout(() => this.connect(), delay);
+          setTimeout(() => {
+            // Re-check at fire time, not just when the timer was scheduled — the
+            // session may have been explicitly logged out/disconnected in the
+            // interim, and resurrecting it here would deliver messages through
+            // an untracked orphan session (SessionManager no longer knows about it).
+            if (this.destroyed) return;
+            this.connect().catch((err) => logger.error({ err, instanceId: this.instanceId }, 'Reconnect attempt failed'));
+          }, delay);
         }
+      }
+      } catch (err) {
+        logger.error({ err, instanceId: this.instanceId }, 'Failed to handle connection.update');
       }
     });
 
@@ -166,28 +225,45 @@ export class BaileysSession {
     // ── Message status updates ─────────────────────────────────────────────
     this.sock.ev.on('messages.update', async (updates) => {
       for (const update of updates) {
-        if (update.update.status !== undefined) {
-          const statusMap: Record<number, string> = { 1: 'sent', 2: 'delivered', 3: 'read', 4: 'read' };
-          const newStatus = statusMap[update.update.status as number];
-          if (newStatus) {
-            // Resolve to the Mongo _id + conversationId the frontend cache is keyed by
-            // (update.key.id is the WhatsApp message id, not our document id).
-            const doc = await Message.findOneAndUpdate(
-              { messageId: update.key.id },
-              { status: newStatus },
-              { new: true }
-            );
-            if (doc) {
-              this.wsGateway.broadcastToWorkspace(this.workspaceId, 'message:status', {
-                conversationId: doc.conversationId.toString(),
-                messageId: doc._id.toString(),
-                status: newStatus,
-              });
-              if (newStatus === 'sent' || newStatus === 'delivered' || newStatus === 'read') {
-                backfillRecipientDeliveryStatus(update.key.id as string, newStatus).catch(() => {});
+        try {
+          if (update.update.status !== undefined) {
+            const statusMap: Record<number, string> = { 1: 'sent', 2: 'delivered', 3: 'read', 4: 'read' };
+            const newStatus = statusMap[update.update.status as number];
+            if (newStatus) {
+              // Resolve to the Mongo _id + conversationId the frontend cache is keyed by
+              // (update.key.id is the WhatsApp message id, not our document id).
+              //
+              // Scoped by workspaceId — messageId alone isn't unique across tenants (our
+              // fallback id for a not-yet-acked send is `temp_${Date.now()}`, which two
+              // workspaces can generate in the same millisecond), so an unscoped query
+              // could update, and then broadcast, another workspace's message.
+              //
+              // $in guards against a late/out-of-order status event downgrading an
+              // already-more-advanced status (e.g. a delayed 'sent' arriving after 'read').
+              const STATUS_RANK: Record<string, number> = { pending: 0, sent: 1, delivered: 2, read: 3 };
+              const notLowerRank = Object.entries(STATUS_RANK)
+                .filter(([, rank]) => rank <= STATUS_RANK[newStatus])
+                .map(([s]) => s);
+              const doc = await Message.findOneAndUpdate(
+                { messageId: update.key.id, workspaceId: this.workspaceId, status: { $in: notLowerRank } },
+                { status: newStatus },
+                { new: true }
+              );
+              if (doc) {
+                const parentConv = await Conversation.findById(doc.conversationId).select('assignedAgentId').lean();
+                this.wsGateway.broadcastToConversationVisibility(this.workspaceId, parentConv?.assignedAgentId?.toString(), 'message:status', {
+                  conversationId: doc.conversationId.toString(),
+                  messageId: doc._id.toString(),
+                  status: newStatus,
+                });
+                if (newStatus === 'sent' || newStatus === 'delivered' || newStatus === 'read') {
+                  backfillRecipientDeliveryStatus(update.key.id as string, newStatus).catch(() => {});
+                }
               }
             }
           }
+        } catch (err) {
+          logger.error({ err, msgId: update.key.id }, 'Failed to process message status update');
         }
       }
     });
@@ -253,7 +329,7 @@ export class BaileysSession {
 
             // Broadcast avatar/name update to frontend so it re-renders without a page refresh
             for (const conv of updatedConversations) {
-              this.wsGateway.broadcastToWorkspace(this.workspaceId, 'conversation:updated', {
+              this.wsGateway.broadcastToConversationVisibility(this.workspaceId, conv.assignedAgentId?.toString(), 'conversation:updated', {
                 conversationId: conv._id.toString(),
                 avatarUrl: imgUrl ?? undefined,
                 ...(notify ? { name: notify } : {}),
@@ -370,7 +446,7 @@ export class BaileysSession {
     });
 
     // ── Group participants ─────────────────────────────────────────────────────
-    this.sock.ev.on('group-participants.update', async ({ id: jid, participants, action }) => {
+    this.sock.ev.on('group-participants.update', async ({ id: jid, action }) => {
       try {
         // Refresh group metadata to get full participant list
         const groupMeta = await this.sock?.groupMetadata(jid);
@@ -399,19 +475,28 @@ export class BaileysSession {
     this.sock.ev.on('chats.upsert', async (chats) => {
       for (const chat of chats) {
         try {
-          // Only update if metadata actually changed (avoid unnecessary writes)
-          const chatMetadata = {
-            archived: chat.archived ?? false,
-            pinnedPosition: (chat.pinned ?? 0) > 0 ? chat.pinned : undefined,
-            muteExpiredAt: chat.muteEnd
-              ? (chat.muteEnd === 0 ? null : new Date(chat.muteEnd * 1000))
-              : undefined,
-            archivedAt: chat.archived ? new Date() : undefined,
-          };
+          // chats.upsert payloads are partial — a field being absent means "unchanged
+          // on WhatsApp's side", not "false/cleared". The old code always overwrote the
+          // *entire* chatMetadata object (defaulting absent fields to false/undefined),
+          // so any manually-set mute/archive from our own UI (conversations.routes.ts's
+          // /mute and /archive endpoints) got silently wiped by the next sync tick.
+          // Only touch the specific dot-paths WhatsApp actually reported.
+          const setFields: Record<string, unknown> = {};
+          if (chat.archived !== undefined) {
+            setFields['chatMetadata.archived'] = chat.archived;
+            setFields['chatMetadata.archivedAt'] = chat.archived ? new Date() : undefined;
+          }
+          if (chat.pinned !== undefined) {
+            setFields['chatMetadata.pinnedPosition'] = chat.pinned > 0 ? chat.pinned : undefined;
+          }
+          if (chat.muteEnd !== undefined) {
+            setFields['chatMetadata.muteExpiredAt'] = chat.muteEnd === 0 ? null : new Date(chat.muteEnd * 1000);
+          }
+          if (Object.keys(setFields).length === 0) continue;
 
           await Conversation.findOneAndUpdate(
             { workspaceId: this.workspaceId, jid: stripDeviceSuffix(chat.id) },
-            { $set: { chatMetadata } }
+            { $set: setFields }
           );
 
           logger.debug(
@@ -427,9 +512,23 @@ export class BaileysSession {
 
   // ── Public API ─────────────────────────────────────────────────────────────
 
-  async sendMessage(jid: string, content: AnyMessageContent, options?: unknown): Promise<WAMessage | undefined> {
+  /** Baileys-shaped send — every existing caller (campaigns, message routes,
+   *  send-message.service) still speaks `AnyMessageContent` directly. Kept
+   *  separate from the channel-neutral `sendMessage()` below rather than
+   *  migrated: several of these payloads (message delete, uploaded-buffer
+   *  media) have no equivalent in the neutral IR and are Baileys-only concepts. */
+  async sendRaw(jid: string, content: AnyMessageContent, options?: unknown): Promise<WAMessage | undefined> {
     if (!this.sock) throw new Error('Instance not connected');
     return this.sock.sendMessage(jid, content, options as Parameters<WASocket['sendMessage']>[2]);
+  }
+
+  /** IChannelSession's neutral entrypoint — translates the channel-neutral IR
+   *  (see messaging/outbound-types.ts) to Baileys' wire format and sends it. */
+  async sendMessage(jid: string, msg: OutboundMessage, options?: unknown): Promise<{ providerMessageId?: string; raw?: unknown }> {
+    const content = toBaileys(msg);
+    if (!content) return {};
+    const sent = await this.sendRaw(jid, content, options);
+    return { providerMessageId: sent?.key?.id ?? undefined, raw: sent };
   }
 
   /** Checks whether phone JIDs are actually registered on WhatsApp — used by campaigns to skip dead numbers before spending a send slot on them. */
@@ -479,11 +578,16 @@ export class BaileysSession {
     this.destroyed = true;
     try { await this.sock?.logout(); } catch { /* ignore */ }
     this.sock = undefined;
+    // `$set: { authCreds: undefined, ... }` is silently dropped by the Mongo driver
+    // — it does NOT clear the field. The WhatsApp session credentials were NEVER
+    // actually deleted on logout: they stayed in the document (retention of
+    // material the user explicitly asked to invalidate), and re-pairing loaded
+    // those now-invalid creds back in, immediately closing the fresh socket with
+    // another 'loggedOut' — the instance was stuck needing a delete+recreate to
+    // recover. Needs an actual $unset.
     await Instance.findByIdAndUpdate(this.instanceId, {
-      status: 'disconnected',
-      authCreds: undefined,
-      authKeys: undefined,
-      qrCode: undefined,
+      $set: { status: 'disconnected' },
+      $unset: { authCreds: 1, authKeys: 1, qrCode: 1 },
     });
   }
 
@@ -598,7 +702,7 @@ export class BaileysSession {
 
     // Extract media metadata (duration, dimensions, thumbnails, etc)
     const mediaMetadata = extractMediaMetadata(msg);
-    const contentWithMedia = {
+    const contentWithMedia: Record<string, unknown> = {
       ...content,
       ...mediaMetadata[type],  // Merge type-specific metadata into content
     };
@@ -652,223 +756,51 @@ export class BaileysSession {
       }
     }
 
-    // Upsert conversation — use workspaceId+jid as the primary key so that manually-created
-    // conversations (which have no instanceId) are found and updated rather than triggering
-    // a duplicate-key error from the { workspaceId, jid } sparse unique index.
-    const conversation = await Conversation.findOneAndUpdate(
-      { workspaceId: this.workspaceId, jid },
-      {
-        $setOnInsert: { workspaceId: this.workspaceId, jid, isGroup, phone },
-        $set: {
-          instanceId: this.instanceId,
-          name: conversationName,
-          lastMessage: { content: lastMessagePreview(type, text), type, direction: msg.key.fromMe ? 'outbound' : 'inbound', timestamp: new Date((msg.messageTimestamp as number) * 1000) },
-          ...(msg.key.fromMe ? {} : { status: 'open' }),
-        },
-        $inc: { unreadCount: msg.key.fromMe ? 0 : 1 },
-      },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
-    );
-    // A fresh upsert has createdAt === updatedAt to the millisecond; used below to
-    // gate one-time actions (e.g. CRM auto-lead-creation) to brand-new conversations only.
-    const isNewConversation = conversation.createdAt.getTime() === conversation.updatedAt.getTime();
-
-    // Opt-in auto-routing: workspaces that want every new inbound conversation routed
-    // immediately (rather than waiting for a bot handoff to a human) set autoRoute='on_new'.
-    if (isNewConversation && !isGroup && !msg.key.fromMe) {
-      getAutoRouteMode(this.workspaceId).then((mode) => {
-        if (mode === 'on_new') void routeConversation(conversation._id.toString(), this.wsGateway);
-      }).catch(() => {});
-    }
-
-    // Every inbound customer message opens/reopens the ticket — start the SLA
-    // clock if the queue/workspace has one configured and none is already running.
-    if (!isGroup && !msg.key.fromMe) {
-      void applySlaTimers(conversation._id.toString(), this.workspaceId, conversation.teamGroupId?.toString());
-      void emitWebhookEvent(this.workspaceId, 'message.received', {
-        conversationId: conversation._id.toString(), phone, text, type,
-      });
-    }
-
-    // Campaign opt-out keyword — a plain-text reply of just "PARAR"/"SAIR"/"STOP"/"CANCELAR"
-    // excludes the contact from every future campaign audience. Doesn't affect normal
-    // 1:1 support messaging, only bulk/campaign sends (see resolveAudience()).
-    if (!isGroup && !msg.key.fromMe && OPT_OUT_KEYWORDS.has(text.trim().toLowerCase())) {
-      Contact.updateOne({ workspaceId: this.workspaceId, jid }, { $set: { optedOutAt: new Date() } }).catch(() => {});
-    }
-
-    // Campaign reply tracking — if this contact received a campaign message recently and
-    // hasn't replied yet, mark it and auto-create a CRM lead (see handleCampaignReply).
-    if (!isGroup && !msg.key.fromMe && conversation.contactId) {
-      handleCampaignReply(this.workspaceId, jid, conversation._id.toString(), conversation.contactId.toString()).catch(() => {});
-    }
-
-    // Notify the assigned agent, but only on the message that makes the conversation go
-    // from "caught up" to "has something new" (unreadCount just became 1) — not on every
-    // message of an already-unread conversation, which would spam a notification per message.
-    if (!isGroup && !msg.key.fromMe && conversation.assignedAgentId && conversation.unreadCount === 1) {
-      notify(this.wsGateway, {
-        workspaceId: this.workspaceId, recipientId: conversation.assignedAgentId.toString(),
-        type: 'conversation.message', title: 'Nova mensagem recebida',
-        message: `${conversationName}: ${lastMessagePreview(type, text)}`,
-        link: '/conversations', metadata: { conversationId: conversation._id.toString() },
-      }).catch(() => {});
-    }
-
-    // Upsert contact (1:1 only — groups aren't contacts)
-    // For new contacts from outbound messages, don't assume senderName is the contact's name
-    // (it's the agent's name). Only set name from pushName for inbound.
-    if (!isGroup) {
-      const contactName = msg.key.fromMe ? phone : (msg.pushName ?? phone);
-      const contactUpdates: Record<string, unknown> = {
-        $setOnInsert: {
-          workspaceId: this.workspaceId,
-          jid,
-          phone,
-          name: contactName,
-        },
-      };
-
-      // Update lastSeenAt and pushName for inbound messages
-      if (!msg.key.fromMe) {
-        contactUpdates.$set = {
-          lastSeenAt: new Date((msg.messageTimestamp as number) * 1000),
-          // Update pushName from inbound message if available
-          ...(msg.pushName ? { pushName: msg.pushName } : {}),
-        };
-      }
-
-      const savedContact = await Contact.findOneAndUpdate(
-        { workspaceId: this.workspaceId, jid },
-        contactUpdates,
-        { upsert: true, new: true }
-      );
-
-      // Link the contact to this conversation if not already linked
-      if (savedContact && conversation && !conversation.contactId) {
-        await Conversation.updateOne(
-          { _id: conversation._id, contactId: { $exists: false } },
-          { $set: { contactId: savedContact._id } }
-        );
-      }
-
-      // CRM: auto-create a lead for brand-new inbound conversations, if a pipeline opted in.
-      if (isNewConversation && !msg.key.fromMe && savedContact) {
-        maybeAutoCreateLeadFromConversation(this.workspaceId, conversation._id, savedContact._id, savedContact.name)
-          .catch((err) => logger.warn({ err }, '[crm] auto-create lead failed'));
-      }
-
-      // Proactively fetch profile picture for new contacts (fire-and-forget)
-      const sock = this.sock;
-      if (sock && savedContact && !savedContact.avatarUrl) {
-        const wsGateway = this.wsGateway;
-        const workspaceId = this.workspaceId;
-        const contactId = savedContact._id;
-        // Engine's .d.ts types profilePictureUrl as (jid) only, but Baileys accepts
-        // (jid, 'image' | 'preview') at runtime — 'image' returns the full-res photo.
-        (sock.profilePictureUrl as (jid: string, type?: 'image' | 'preview') => Promise<string>)(jid, 'image')
-          .then(async (picUrl) => {
-            if (!picUrl) return;
-            await Contact.updateOne({ _id: contactId }, { $set: { avatarUrl: picUrl } });
-            const updatedConvs = await Conversation.find({ workspaceId, jid });
-            await Conversation.updateMany({ workspaceId, jid }, { $set: { avatarUrl: picUrl } });
-            for (const conv of updatedConvs) {
-              wsGateway.broadcastToWorkspace(workspaceId, 'conversation:updated', {
-                conversationId: conv._id.toString(),
-                avatarUrl: picUrl,
-              });
-            }
-            logger.debug({ jid, picUrl }, 'Avatar fetched and saved');
-          })
-          .catch(() => { /* contact privacy blocks picture — ignore */ });
-      }
-    }
-
-    // For media messages, pre-generate message ID so we can embed the proxy URL.
-    // NOTE: set the URL on `contentWithMedia` (the object actually persisted) — not
-    // on `content`, which was already spread into contentWithMedia above.
-    const msgObjectId = new Types.ObjectId();
-    const mediaTypes = ['image', 'video', 'audio', 'document', 'sticker'];
-    if (mediaTypes.includes(type)) {
-      (contentWithMedia as Record<string, unknown>).url =
-        `/api/conversations/${conversation._id}/messages/${msgObjectId}/media`;
-    }
-
     // For group messages: extract sender JID from msg.key.participant (who sent this message)
     const senderJid = isGroup && !msg.key.fromMe ? msg.key.participant : undefined;
     const senderPhoneFromJid = senderJid ? parseJid(senderJid) : undefined;
 
-    // Save message. Guard against the rare race where two concurrent deliveries
-    // both clear the exists() check above — the unique index rejects the second,
-    // which we swallow instead of crashing.
-    let savedMsg;
-    try {
-      savedMsg = await Message.create({
-        _id: msgObjectId,
+    const sock = this.sock;
+    await ingestInboundMessage(
+      {
         workspaceId: this.workspaceId,
         instanceId: this.instanceId,
-        conversationId: conversation._id,
         jid,
         messageId,
-        direction: msg.key.fromMe ? 'outbound' : 'inbound',
-        type,
-        status: msg.key.fromMe ? 'sent' : 'delivered',
         fromMe: msg.key.fromMe ?? false,
-        content: contentWithMedia,  // Includes media metadata
-        quoted: quotedContext,      // Quoted message context (if reply)
-        // Attribute the sender for inbound group messages so the UI can show who spoke.
-        senderName: isGroup && !msg.key.fromMe ? senderName : undefined,
+        isGroup,
+        phone,
+        type,
+        text: text ?? '',
+        content: contentWithMedia,
+        quoted: quotedContext,
+        senderName,
+        contactDisplayName: !msg.key.fromMe ? msg.pushName : undefined,
+        conversationName,
         senderJid,
         senderPhone: senderPhoneFromJid,
+        timestamp: new Date((msg.messageTimestamp as number) * 1000),
         rawPayload: msg as unknown as Record<string, unknown>,
-      });
-    } catch (err) {
-      if ((err as { code?: number }).code === 11000) return; // duplicate — already stored
-      throw err;
-    }
-
-    // Broadcast to frontend via WS — shape must match the frontend Message contract
-    // (the REST adapter maps createdAt → timestamp; we mirror that here).
-    this.wsGateway.broadcastToWorkspace(this.workspaceId, 'message:new', {
-      conversationId: conversation._id.toString(),
-      message: {
-        id: savedMsg._id.toString(),
-        conversationId: conversation._id.toString(),
-        type: savedMsg.type,
-        content: {
-          ...savedMsg.content,
-          // Extract media-specific metadata to top-level for UI convenience
-          ...(type === 'audio' && savedMsg.content.audio ? { audio: savedMsg.content.audio } : {}),
-          ...(type === 'video' && savedMsg.content.video ? { video: savedMsg.content.video } : {}),
-          ...(type === 'image' && savedMsg.content.image ? { image: savedMsg.content.image } : {}),
-        },
-        direction: savedMsg.direction,
-        status: savedMsg.status,
-        timestamp: savedMsg.createdAt.toISOString(),
-        senderName: savedMsg.senderName,
-        senderJid: savedMsg.senderJid,
-        senderPhone: savedMsg.senderPhone,
-        quoted: savedMsg.quoted,    // Include quoted message context
+        providerMessage: msg,
       },
-    });
-
-    // ── Flow automation: trigger flows on inbound messages (1:1 and groups) ──
-    // Group flows are disabled by default; a flow can opt-in via trigger.allowGroups.
-    if (!msg.key.fromMe && this.sock) {
-      const sock = this.sock;
-      handleInboundForFlows({
-        workspaceId: this.workspaceId,
-        instanceId: this.instanceId,
-        isGroup,
-        conversation: { _id: conversation._id, contactId: conversation.contactId, name: conversation.name, phone: conversation.phone, jid },
-        contact: { name: conversation.name, phone: conversation.phone },
-        text: text ?? '',
-        msg,
-        sendMessage: this.makeFlowSend(),
-        sendPresence: async (j, state) => { await sock.sendPresenceUpdate(state, j); },
+      {
         wsGateway: this.wsGateway,
-      }).catch((err) => logger.warn({ err }, '[flow] inbound handler failed'));
-    }
+        sendMessage: this.makeFlowSend(),
+        sendPresence: sock ? async (j, state) => { await sock.sendPresenceUpdate(state, j); } : undefined,
+        // Engine's .d.ts types profilePictureUrl as (jid) only, but Baileys accepts
+        // (jid, 'image' | 'preview') at runtime — 'image' returns the full-res photo.
+        fetchAvatar: sock
+          ? (j) => (sock.profilePictureUrl as (jid: string, type?: 'image' | 'preview') => Promise<string>)(j, 'image')
+          : undefined,
+        archiveMedia: sock ? async (savedMessageId) => {
+          const { downloadMediaMessage } = await import('@webwhatsapp/engine');
+          const buffer = await downloadMediaMessage(msg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+          const mimeType = String(contentWithMedia.mimeType || 'application/octet-stream');
+          const fileName = typeof contentWithMedia.fileName === 'string' ? contentWithMedia.fileName : undefined;
+          await archiveMessageMedia(savedMessageId, this.workspaceId, Buffer.from(buffer), mimeType, fileName);
+        } : undefined,
+      }
+    );
   }
 
   /**
@@ -901,6 +833,8 @@ export class BaileysSession {
       conversationId: string; jid: string; contact: { name?: string; phone?: string };
       /** Extra variables to seed the run with (e.g. a webhook trigger's custom payload fields) — available as {{chave}} in the flow. */
       _inheritedVariables?: Record<string, unknown>;
+      /** scheduled trigger only — see FlowRunner.start(). */
+      _scheduledEventSourceAt?: Date;
     }
   ): Promise<void> {
     if (!this.sock) return;
@@ -918,6 +852,33 @@ export class BaileysSession {
       jid: params.jid,
       contact: params.contact,
       _inheritedVariables: params._inheritedVariables,
+      _scheduledEventSourceAt: params._scheduledEventSourceAt,
     });
+  }
+
+  /** Resume a run parked in status='delayed' — called by flow-run-scheduler.ts. */
+  async continueDelayedFlowRun(runId: string): Promise<void> {
+    if (!this.sock) return;
+    const sock = this.sock;
+    const { FlowRunner } = await import('../flow-executor');
+    const runner = new FlowRunner({
+      sendMessage: this.makeFlowSend(),
+      sendPresence: async (j, state) => { await sock.sendPresenceUpdate(state, j); },
+      wsGateway: this.wsGateway,
+    });
+    await runner.continueDelayed(runId);
+  }
+
+  /** Fire an overdue wait_response timeout — called by flow-run-scheduler.ts. */
+  async continueTimedOutFlowRun(runId: string): Promise<void> {
+    if (!this.sock) return;
+    const sock = this.sock;
+    const { FlowRunner } = await import('../flow-executor');
+    const runner = new FlowRunner({
+      sendMessage: this.makeFlowSend(),
+      sendPresence: async (j, state) => { await sock.sendPresenceUpdate(state, j); },
+      wsGateway: this.wsGateway,
+    });
+    await runner.continueTimedOut(runId);
   }
 }

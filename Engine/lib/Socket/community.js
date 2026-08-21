@@ -66,15 +66,18 @@ const makeCommunitiesSocket = (config) => {
     }
     
     suki.ws.on('CB:ib,,dirty', async (node) => {
-    	const { attrs } = WABinary_1.getBinaryNodeChild(node, 'dirty') 
-    
-    	if (attrs.type !== 'communities') {
+      try {
+    	const dirtyNode = WABinary_1.getBinaryNodeChild(node, 'dirty')
+    	if (!dirtyNode || dirtyNode.attrs.type !== 'communities') {
     		return
     	}
-    
-    	await communityFetchAllParticipating() 
-    	await suki.cleanDirtyBits('groups') 
-    }) 
+
+    	await communityFetchAllParticipating()
+    	await suki.cleanDirtyBits('groups')
+      } catch (err) {
+        suki.onUnexpectedError(err, 'handling dirty sync (communities)')
+      }
+    })
     
     return {
         ...suki,

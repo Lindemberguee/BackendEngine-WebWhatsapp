@@ -2,19 +2,24 @@
 import type { FastifyInstance } from 'fastify';
 import { Types } from 'mongoose';
 import { Pipeline, Lead, Contact, LeadActivity } from '../../db/models';
-import { DEFAULT_STAGES, ensureDefaultPipeline, toLeadResponse, nextOrder, logLeadActivity, getActorName, getCrmReport } from './crm.service';
+import { DEFAULT_STAGES, ensureDefaultPipeline, toLeadResponse, nextOrder, logLeadActivity, getActorName, getCrmReport, getCrossPipelineReport } from './crm.service';
 import { triggerCrmFlow } from './crm-triggers';
 import { notify } from '../notifications/notification.service';
 import { emitWebhookEvent } from '../webhooks/webhook.service';
 import type { SessionManager } from '../../session-manager/SessionManager';
 import type { WebSocketGateway } from '../../ws/gateway';
 import { requireRole } from '../../utils/require-role';
+import { assertCanCreatePipeline } from '../billing/billing.service';
+import { escapeRegex } from '../../shared/string-utils';
 
 const valid = (id: string) => Types.ObjectId.isValid(id);
 
 export async function crmRoutes(fastify: FastifyInstance, opts: { sessionManager: SessionManager; wsGateway: WebSocketGateway }): Promise<void> {
   const auth = { preHandler: [fastify.authenticate] };
   const canWrite = { preHandler: [fastify.authenticate, requireRole(['owner', 'admin', 'agent'])] };
+  // Archiving a whole pipeline (and every lead in it) is a bigger blast radius
+  // than everyday CRM writes — restrict it past the general canWrite gate.
+  const canManagePipelines = { preHandler: [fastify.authenticate, requireRole(['owner', 'admin'])] };
 
   // ─── Pipelines ──────────────────────────────────────────────────────────────
 
@@ -27,10 +32,22 @@ export async function crmRoutes(fastify: FastifyInstance, opts: { sessionManager
 
   fastify.post('/pipelines', canWrite, async (request, reply) => {
     const { workspaceId } = request.user as { workspaceId: string };
-    const body = request.body as { name?: string; description?: string; stages?: any[] };
+    const body = request.body as { name?: string; description?: string; stages?: any[]; customFieldDefs?: any[]; autoCreateFromConversation?: boolean };
     if (!body.name?.trim()) return reply.status(400).send({ error: 'Nome é obrigatório' });
+    try {
+      await assertCanCreatePipeline(workspaceId);
+    } catch (err) {
+      return reply.status(400).send({ error: (err as Error).message });
+    }
     const stages = Array.isArray(body.stages) && body.stages.length ? body.stages : DEFAULT_STAGES;
-    const p = await Pipeline.create({ workspaceId: new Types.ObjectId(workspaceId), name: body.name.trim(), description: body.description, stages });
+    const p = await Pipeline.create({
+      workspaceId: new Types.ObjectId(workspaceId),
+      name: body.name.trim(),
+      description: body.description,
+      stages,
+      customFieldDefs: Array.isArray(body.customFieldDefs) ? body.customFieldDefs : undefined,
+      autoCreateFromConversation: body.autoCreateFromConversation ?? false,
+    });
     return reply.status(201).send(p.toJSON());
   });
 
@@ -46,7 +63,7 @@ export async function crmRoutes(fastify: FastifyInstance, opts: { sessionManager
     return reply.send(p.toJSON());
   });
 
-  fastify.delete('/pipelines/:id', canWrite, async (request, reply) => {
+  fastify.delete('/pipelines/:id', canManagePipelines, async (request, reply) => {
     const { workspaceId } = request.user as { workspaceId: string };
     const { id } = request.params as { id: string };
     if (!valid(id)) return reply.status(404).send({ error: 'Funil não encontrado' });
@@ -58,9 +75,18 @@ export async function crmRoutes(fastify: FastifyInstance, opts: { sessionManager
 
   fastify.get('/reports', auth, async (request, reply) => {
     const { workspaceId } = request.user as { workspaceId: string };
-    const { pipelineId } = request.query as { pipelineId?: string };
-    if (!pipelineId || !valid(pipelineId)) return reply.status(400).send({ error: 'pipelineId é obrigatório' });
-    const report = await getCrmReport(workspaceId, pipelineId);
+    const { pipelineId, from, to } = request.query as { pipelineId?: string; from?: string; to?: string };
+    if (!pipelineId) return reply.status(400).send({ error: 'pipelineId é obrigatório' });
+    const range = { from: from ? new Date(from) : undefined, to: to ? new Date(to) : undefined };
+
+    if (pipelineId === 'all') {
+      const report = await getCrossPipelineReport(workspaceId, range);
+      if (!report) return reply.status(404).send({ error: 'Nenhum funil encontrado' });
+      return reply.send(report);
+    }
+
+    if (!valid(pipelineId)) return reply.status(400).send({ error: 'pipelineId inválido' });
+    const report = await getCrmReport(workspaceId, pipelineId, range);
     if (!report) return reply.status(404).send({ error: 'Funil não encontrado' });
     return reply.send(report);
   });
@@ -76,7 +102,7 @@ export async function crmRoutes(fastify: FastifyInstance, opts: { sessionManager
     if (status) filter.status = status;
     if (assigneeId && valid(assigneeId)) filter.assigneeId = assigneeId;
     if (tag) filter.tags = tag;
-    if (search) filter.title = { $regex: search, $options: 'i' };
+    if (search) filter.title = { $regex: escapeRegex(search), $options: 'i' };
     const leads = await Lead.find(filter).sort({ stageId: 1, order: 1 })
       .populate('contactId', 'name phone avatarUrl email')
       .populate('assigneeId', 'name');
@@ -115,6 +141,7 @@ export async function crmRoutes(fastify: FastifyInstance, opts: { sessionManager
       assigneeId: body.assigneeId && valid(body.assigneeId) ? body.assigneeId : undefined,
       tags: Array.isArray(body.tags) ? body.tags : (contact.tags ?? []),
       notes: body.notes ?? '',
+      expectedCloseDate: body.expectedCloseDate ? new Date(body.expectedCloseDate) : undefined,
       source: ['manual', 'flow', 'conversation'].includes(body.source) ? body.source : 'manual',
       order: await nextOrder(wid, pipeline._id as Types.ObjectId, stageId),
     });
@@ -151,8 +178,17 @@ export async function crmRoutes(fastify: FastifyInstance, opts: { sessionManager
     const changedValue = 'value' in body && Number(body.value) !== existing.value;
     const changedNotes = 'notes' in body && body.notes && body.notes !== existing.notes;
     const changedAssignee = 'assigneeId' in body && String(update.assigneeId ?? '') !== String(existing.assigneeId ?? '');
-    if (changedValue || changedNotes || changedAssignee) {
+    const newTags = Array.isArray(body.tags) ? (body.tags as string[]) : undefined;
+    const addedTags = newTags ? newTags.filter((t) => !existing.tags.includes(t)) : [];
+    const removedTags = newTags ? existing.tags.filter((t) => !newTags.includes(t)) : [];
+    if (changedValue || changedNotes || changedAssignee || addedTags.length || removedTags.length) {
       const actorName = await getActorName(actorId);
+      for (const tag of addedTags) {
+        await logLeadActivity({ workspaceId, leadId, type: 'tag_added', actorId, actorName, message: `Etiqueta "${tag}" adicionada` });
+      }
+      for (const tag of removedTags) {
+        await logLeadActivity({ workspaceId, leadId, type: 'tag_removed', actorId, actorName, message: `Etiqueta "${tag}" removida` });
+      }
       if (changedValue) {
         await logLeadActivity({
           workspaceId, leadId, type: 'value_changed', actorId, actorName,

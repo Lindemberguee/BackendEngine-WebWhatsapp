@@ -10,6 +10,8 @@ export interface IContact extends Document {
   name: string;      // Display name (editable)
   pushName?: string; // Name from WhatsApp (read-only)
   email?: string;    // Email address
+  company?: string;  // Company name
+  position?: string; // Job title
   avatarUrl?: string; // Profile picture
   tags: string[];    // Custom tags
   notes?: string;    // Internal notes
@@ -21,6 +23,9 @@ export interface IContact extends Document {
   lastSeenAt?: Date; // Last time they messaged us
   /** Set when the contact opts out of bulk/campaign messages (e.g. replies "PARAR"). Excluded from all campaign audiences. */
   optedOutAt?: Date;
+  whatsappOptInAt?: Date;
+  whatsappOptInSource?: string;
+  whatsappOptInProof?: string;
   metadata?: {
     source?: string;
     importedFrom?: string;
@@ -39,6 +44,8 @@ const ContactSchema = new Schema<IContact>(
     name:              { type: String, required: true, trim: true },
     pushName:          { type: String },
     email:             { type: String, lowercase: true, trim: true, sparse: true },
+    company:           { type: String, trim: true },
+    position:          { type: String, trim: true },
     avatarUrl:         { type: String },
     tags:              [{ type: String }],
     notes:             { type: String, default: '' },
@@ -49,6 +56,9 @@ const ContactSchema = new Schema<IContact>(
     conversationCount: { type: Number, default: 0, min: 0 },
     lastSeenAt:        { type: Date },
     optedOutAt:        { type: Date },
+    whatsappOptInAt:   { type: Date },
+    whatsappOptInSource: { type: String },
+    whatsappOptInProof:  { type: String },
     metadata: {
       source:         { type: String },
       importedFrom:   { type: String },

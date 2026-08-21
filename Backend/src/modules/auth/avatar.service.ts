@@ -27,7 +27,10 @@ export async function saveAvatar(userId: string, workspaceId: string, dataUrl: s
 }
 
 /** Public, cache-busted URL for a user's avatar — same exposure level as a WhatsApp contact
- *  photo (already rendered directly as <img src> everywhere), so no auth is required to fetch it. */
+ *  photo (already rendered directly as <img src> everywhere), so no auth is required to fetch it.
+ *  The route itself has a dedicated tight rate limit (see auth.routes.ts) so guessing/enumerating
+ *  ObjectIds at scale isn't practical, without requiring every already-issued avatarUrl (persisted
+ *  in Mongo and in signed-in browsers' localStorage) to be migrated to a new signed format. */
 export function avatarUrlFor(userId: string): string {
   const base = process.env.PUBLIC_API_URL ?? 'http://localhost:3333';
   return `${base}/api/auth/avatar/${userId}?v=${Date.now()}`;

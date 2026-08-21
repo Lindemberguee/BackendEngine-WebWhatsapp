@@ -13,6 +13,8 @@ export interface PlanLimits {
   /** cap on ACTIVE (published) flows, not total flows saved */
   activeAutomations: number | null;
   campaignsEnabled: boolean;
+  /** Meta WhatsApp Cloud API (BYO-WABA) as a connectable instance channel. */
+  officialChannelEnabled: boolean;
   crmMultiPipeline: boolean;
   /** null = full history */
   analyticsRetentionDays: number | null;
@@ -52,6 +54,7 @@ export const PLANS: PlanDefinition[] = [
       agents: 2,
       activeAutomations: 3,
       campaignsEnabled: false,
+      officialChannelEnabled: false,
       crmMultiPipeline: false,
       analyticsRetentionDays: 7,
       multiWorkspace: false,
@@ -82,6 +85,7 @@ export const PLANS: PlanDefinition[] = [
       agents: 10,
       activeAutomations: null,
       campaignsEnabled: true,
+      officialChannelEnabled: true,
       crmMultiPipeline: true,
       analyticsRetentionDays: 90,
       multiWorkspace: false,
@@ -110,6 +114,7 @@ export const PLANS: PlanDefinition[] = [
       agents: null,
       activeAutomations: null,
       campaignsEnabled: true,
+      officialChannelEnabled: true,
       crmMultiPipeline: true,
       analyticsRetentionDays: null,
       multiWorkspace: true,

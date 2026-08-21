@@ -3,9 +3,11 @@ import { Types } from 'mongoose';
 import {
   Workspace, User, Conversation, Message, Contact, Lead, Pipeline, Campaign, AuditLog,
 } from '../../db/models';
-import { getOrCreateSubscription } from '../billing/billing.service';
+import { getOrCreateSubscription, assertCanCreateWorkspace } from '../billing/billing.service';
 import { notify } from '../notifications/notification.service';
 import { deletionDeadline } from './workspace-deletion.service';
+import { validateWorkspaceTheme, type WorkspaceTheme } from './theme-validation';
+import { requireRole } from '../../utils/require-role';
 import type { WebSocketGateway } from '../../ws/gateway';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -110,6 +112,12 @@ export async function workspacesRoutes(fastify: FastifyInstance, opts: { wsGatew
 
     if (!name?.trim()) return reply.status(400).send({ error: 'Nome do workspace é obrigatório' });
 
+    try {
+      await assertCanCreateWorkspace(sub);
+    } catch (err) {
+      return reply.status(400).send({ error: (err as Error).message });
+    }
+
     // Get creator's info
     const creator = await User.findById(sub).lean();
     if (!creator) return reply.status(401).send({ error: 'Usuário não encontrado' });
@@ -179,6 +187,55 @@ export async function workspacesRoutes(fastify: FastifyInstance, opts: { wsGatew
     return reply.send({ data: await buildWorkspacePayload(ws) });
   });
 
+  // GET /api/workspaces/:id/theme — any member can read (needed to render the app)
+  fastify.get('/:id/theme', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const { workspaceId } = request.user as { workspaceId: string };
+
+    if (!Types.ObjectId.isValid(id)) return reply.status(400).send({ error: 'ID inválido' });
+    if (id !== workspaceId) return reply.status(403).send({ error: 'Sem acesso' });
+
+    const ws = await Workspace.findById(id).select('settings').lean();
+    if (!ws) return reply.status(404).send({ error: 'Workspace não encontrado' });
+
+    const theme = (ws.settings as Record<string, unknown> | undefined)?.theme ?? null;
+    return reply.send({ data: theme });
+  });
+
+  // PATCH /api/workspaces/:id/theme — owner/admin only, writes settings.theme without touching other settings keys
+  fastify.patch('/:id/theme', { preHandler: [fastify.authenticate, requireRole(['owner', 'admin'])] }, async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const { workspaceId } = request.user as { workspaceId: string };
+
+    if (!Types.ObjectId.isValid(id)) return reply.status(400).send({ error: 'ID inválido' });
+    if (id !== workspaceId) return reply.status(403).send({ error: 'Sem acesso' });
+
+    const result = validateWorkspaceTheme(request.body);
+    if ('error' in result) return reply.status(400).send({ error: result.error });
+
+    const theme: WorkspaceTheme = result.theme;
+    const ws = await Workspace.findByIdAndUpdate(
+      id,
+      { $set: { 'settings.theme': theme } },
+      { new: true },
+    ).select('settings').lean();
+    if (!ws) return reply.status(404).send({ error: 'Workspace não encontrado' });
+
+    try {
+      const me = await User.findById((request.user as { sub: string }).sub).lean();
+      if (me) {
+        await AuditLog.create({
+          workspaceId: new Types.ObjectId(workspaceId),
+          actor: { id: me._id, name: me.name, email: me.email },
+          type: 'workspace.settings_updated',
+          metadata: { theme: 'updated' },
+        });
+      }
+    } catch { /* audit failure is non-fatal */ }
+
+    return reply.send({ data: theme });
+  });
+
   // POST /api/workspaces/switch — switch to another workspace, return new JWT
   fastify.post('/switch', { preHandler: [fastify.authenticate] }, async (request, reply) => {
     const { sub } = request.user as { sub: string };
@@ -199,11 +256,17 @@ export async function workspacesRoutes(fastify: FastifyInstance, opts: { wsGatew
     const ws = await Workspace.findById(targetWsId).lean();
     if (!ws) return reply.status(404).send({ error: 'Workspace não encontrado' });
 
-    // Issue new token scoped to target workspace
+    // Issue new token scoped to target workspace. Every other jwt.sign() call site
+    // includes tokenVersion — omitting it here meant `authenticate` (server.ts),
+    // which treats a missing claim as 0, rejected this token the moment the target
+    // user had ever changed their password, hit "log out other sessions", or had
+    // their role changed (all of which bump tokenVersion above 0): instant 401 right
+    // after switching, indistinguishable from a broken feature.
     const token = fastify.jwt.sign({
       sub: String(targetUser._id),
       workspaceId: targetWsId,
       role: targetUser.role,
+      tokenVersion: targetUser.tokenVersion ?? 0,
     });
 
     const workspace = await buildWorkspacePayload(ws);

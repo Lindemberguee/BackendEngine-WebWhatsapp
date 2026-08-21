@@ -35,6 +35,10 @@ export interface IFlow extends Document {
     crmStageId?: string;
     /** webhook only — generated once, kept stable across saves; part of the public trigger URL /api/webhooks/in/:token. */
     webhookToken?: string;
+    /** scheduled only — which per-conversation event anchors the delay. */
+    scheduledEvent?: 'conversation_created' | 'no_reply' | 'conversation_closed';
+    /** scheduled only — minutes after scheduledEvent before the flow fires. */
+    scheduledDelayMinutes?: number;
   };
   nodes: IFlowNode[];
   edges: IFlowEdge[];
@@ -59,6 +63,8 @@ const FlowSchema = new Schema<IFlow>(
       crmPipelineId: { type: Schema.Types.ObjectId, ref: 'Pipeline' },
       crmStageId: { type: String },
       webhookToken: { type: String },
+      scheduledEvent: { type: String, enum: ['conversation_created', 'no_reply', 'conversation_closed'] },
+      scheduledDelayMinutes: { type: Number },
     },
     nodes: { type: Schema.Types.Mixed, default: [] },
     edges: { type: Schema.Types.Mixed, default: [] },

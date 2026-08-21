@@ -17,7 +17,7 @@ name: Backend Deploy
 on:
   workflow_run:
     workflows: ['Backend CI']
-    branches: [main]
+    branches: [master]
     types: [completed]
 
 jobs:

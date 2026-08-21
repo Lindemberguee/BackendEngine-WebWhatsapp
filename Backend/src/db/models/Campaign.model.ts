@@ -39,6 +39,11 @@ export interface ICampaignStats {
   replied: number;
   failed: number;
   skipped: number;
+  /** Sum of every successfully-sent recipient's estimatedCostCents (see
+   *  CampaignRecipient) — the platform's own rate-card estimate, not Meta's
+   *  actual bill. Only sends that really went out are counted, unlike the
+   *  pre-send estimate which includes contacts that may later be skipped. */
+  estimatedCostCents: number;
 }
 
 export interface ICampaign extends Document {
@@ -59,9 +64,17 @@ export interface ICampaign extends Document {
   nextSendAt?: Date;
   /** Consecutive send failures — auto-pauses the campaign past a threshold (possible ban/connectivity signal). */
   consecutiveFailures: number;
+  /** Last time the owner was notified that no configured instance has a ready
+   *  session — dedup guard so a campaign stuck in 'no_capacity' doesn't spam a
+   *  notification on every dispatcher tick while it's stalled. */
+  sessionAlertedAt?: Date;
   startedAt?: Date;
   completedAt?: Date;
   stats: ICampaignStats;
+  /** Currency stats.estimatedCostCents is denominated in — set on the first
+   *  costed send; a campaign only ever spans one currency in practice (one
+   *  rate-card maintainer, one platform). */
+  estimatedCostCurrency?: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -95,6 +108,7 @@ const CampaignSchema = new Schema<ICampaign>(
     scheduledAt: { type: Date },
     nextSendAt:  { type: Date },
     consecutiveFailures: { type: Number, default: 0 },
+    sessionAlertedAt: { type: Date },
     startedAt:   { type: Date },
     completedAt: { type: Date },
     stats: {
@@ -106,7 +120,9 @@ const CampaignSchema = new Schema<ICampaign>(
       replied:   { type: Number, default: 0 },
       failed:    { type: Number, default: 0 },
       skipped:   { type: Number, default: 0 },
+      estimatedCostCents: { type: Number, default: 0 },
     },
+    estimatedCostCurrency: { type: String },
   },
   { timestamps: true }
 );

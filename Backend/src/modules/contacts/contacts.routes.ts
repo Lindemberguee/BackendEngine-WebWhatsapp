@@ -1,7 +1,6 @@
 ﻿import type { FastifyInstance } from "fastify";
 import { Types } from "mongoose";
-import pino from "pino";
-import { Contact, Conversation, Message } from "../../db/models";
+import { Contact, Conversation, Message, AuditLog, User, Lead, CampaignRecipient } from "../../db/models";
 import { ensureLabel } from "../labels/labels.service";
 import {
   CreateContactSchema,
@@ -9,12 +8,33 @@ import {
   ListContactsQuerySchema,
   BulkTagSchema,
   BulkStatusSchema,
+  ImportContactsSchema,
   type ContactResponse,
   type ContactDetailResponse,
   type ListContactsResponse,
 } from "./contacts.dto";
+import { requireRole } from "../../utils/require-role";
 
-const logger = pino();
+/** Best-effort audit entry for a contact action — merged back into GET
+ *  /:id/activity so the timeline shows more than just "message" events (the
+ *  types themselves — contact.updated/contact.deleted — already existed in
+ *  workspace.types.ts's AuditEventType, just never written for contacts). */
+async function logContactAudit(
+  workspaceId: string, actorId: string | undefined, contactId: string,
+  type: 'contact.updated' | 'contact.deleted', label: string
+): Promise<void> {
+  try {
+    if (!actorId || !Types.ObjectId.isValid(actorId)) return;
+    const actor = await User.findById(actorId).select('name email').lean();
+    if (!actor) return;
+    await AuditLog.create({
+      workspaceId: new Types.ObjectId(workspaceId),
+      actor: { id: actor._id, name: actor.name, email: actor.email },
+      type,
+      target: { type: 'contact', id: contactId, label },
+    });
+  } catch { /* audit failure is non-fatal */ }
+}
 
 function toContactResponse(doc: any): ContactResponse {
   return {
@@ -22,6 +42,8 @@ function toContactResponse(doc: any): ContactResponse {
     phone: doc.phone,
     name: doc.name,
     email: doc.email,
+    company: doc.company,
+    position: doc.position,
     avatarUrl: doc.avatarUrl,
     tags: doc.tags || [],
     status: doc.status || "active",
@@ -31,6 +53,9 @@ function toContactResponse(doc: any): ContactResponse {
     createdAt: doc.createdAt.toISOString(),
     updatedAt: doc.updatedAt.toISOString(),
     conversationCount: doc.conversationCount || 0,
+    whatsappOptInAt: doc.whatsappOptInAt?.toISOString(),
+    whatsappOptInSource: doc.whatsappOptInSource,
+    whatsappOptInProof: doc.whatsappOptInProof,
   };
 }
 
@@ -39,6 +64,7 @@ function toContactDetailResponse(doc: any, recentMessages: any[] = []): ContactD
     ...toContactResponse(doc),
     pushName: doc.pushName,
     jid: doc.jid,
+    customFields: doc.customFields instanceof Map ? Object.fromEntries(doc.customFields) : (doc.customFields ?? {}),
     recentMessages: recentMessages.map((msg) => ({
       id: msg._id.toString(),
       content: msg.content?.text || msg.content?.caption || `[${msg.type}]`,
@@ -50,6 +76,10 @@ function toContactDetailResponse(doc: any, recentMessages: any[] = []): ContactD
 
 export async function contactsRoutes(fastify: FastifyInstance): Promise<void> {
   const auth = { preHandler: [fastify.authenticate] };
+  // Matches the real permission matrix (workspace.types.ts): agent has contacts:write
+  // but not contacts:delete; viewer has neither.
+  const canWrite = { preHandler: [fastify.authenticate, requireRole(["owner", "admin", "agent"])] };
+  const canDelete = { preHandler: [fastify.authenticate, requireRole(["owner", "admin"])] };
 
   fastify.get("/", auth, async (request, reply) => {
     try {
@@ -123,7 +153,7 @@ export async function contactsRoutes(fastify: FastifyInstance): Promise<void> {
     }
   });
 
-  fastify.post("/", auth, async (request, reply) => {
+  fastify.post("/", canWrite, async (request, reply) => {
     try {
       const { workspaceId } = request.user as { workspaceId: string };
       const input = CreateContactSchema.parse(request.body);
@@ -144,9 +174,16 @@ export async function contactsRoutes(fastify: FastifyInstance): Promise<void> {
         jid,
         name: input.name,
         email: input.email,
+        company: input.company,
+        position: input.position,
         tags: input.tags,
         notes: input.notes,
         source: input.source,
+        ...(input.marketingOptIn ? {
+          whatsappOptInAt: new Date(),
+          whatsappOptInSource: input.marketingOptInSource ?? 'manual',
+          whatsappOptInProof: input.marketingOptInProof,
+        } : {}),
       });
 
       reply.status(201).send(toContactResponse(contact));
@@ -156,9 +193,71 @@ export async function contactsRoutes(fastify: FastifyInstance): Promise<void> {
     }
   });
 
-  fastify.patch<{ Params: { id: string } }>("/:id", auth, async (request, reply) => {
+  // POST /api/contacts/import — bulk create/update from a client-parsed CSV.
+  // Uses bulkWrite+upsert (not the single-contact 409-on-duplicate path above)
+  // so a batch with some already-existing contacts doesn't fail outright.
+  fastify.post("/import", canWrite, async (request, reply) => {
     try {
       const { workspaceId } = request.user as { workspaceId: string };
+      const input = ImportContactsSchema.parse(request.body);
+      const wsObjectId = new Types.ObjectId(workspaceId);
+      const optInAt = input.marketingOptIn ? new Date() : undefined;
+
+      const seenJids = new Set<string>();
+      const errors: { row: number; reason: string }[] = [];
+      const ops: Array<{
+        updateOne: {
+          filter: { workspaceId: Types.ObjectId; jid: string };
+          update: { $set: Record<string, unknown>; $unset?: Record<string, 1> };
+          upsert: true;
+        };
+      }> = [];
+
+      input.contacts.forEach((c, row) => {
+        const phone = c.phone.replace(/\D/g, "");
+        if (!phone) { errors.push({ row, reason: "Telefone inválido" }); return; }
+        const jid = `${phone}@s.whatsapp.net`;
+        if (seenJids.has(jid)) { errors.push({ row, reason: "Duplicado na planilha" }); return; }
+        seenJids.add(jid);
+        ops.push({
+          updateOne: {
+            filter: { workspaceId: wsObjectId, jid },
+            update: {
+              $set: {
+                phone, jid, name: c.name, email: c.email, tags: c.tags, notes: c.notes, source: "import",
+                ...(optInAt ? {
+                  whatsappOptInAt: optInAt,
+                  whatsappOptInSource: input.marketingOptInSource!.trim(),
+                  ...(input.marketingOptInProof?.trim() ? { whatsappOptInProof: input.marketingOptInProof.trim() } : {}),
+                } : {}),
+              },
+              ...(optInAt ? { $unset: { optedOutAt: 1 } } : {}),
+            },
+            upsert: true,
+          },
+        });
+      });
+
+      if (ops.length === 0) {
+        return reply.send({ created: 0, updated: 0, skipped: errors.length, errors });
+      }
+
+      const result = await Contact.bulkWrite(ops, { ordered: false });
+      reply.send({
+        created: result.upsertedCount ?? 0,
+        updated: result.modifiedCount ?? 0,
+        skipped: errors.length,
+        errors,
+      });
+    } catch (err) {
+      fastify.log.error(err);
+      reply.status(400).send({ error: "Invalid request" });
+    }
+  });
+
+  fastify.patch<{ Params: { id: string } }>("/:id", canWrite, async (request, reply) => {
+    try {
+      const { workspaceId, sub } = request.user as { workspaceId: string; sub?: string };
       const { id } = request.params;
 
       if (!Types.ObjectId.isValid(id)) return reply.status(400).send({ error: "Invalid contact ID" });
@@ -171,10 +270,20 @@ export async function contactsRoutes(fastify: FastifyInstance): Promise<void> {
           $set: {
             ...(input.name && { name: input.name }),
             ...(input.email !== undefined && { email: input.email }),
+            ...(input.company !== undefined && { company: input.company }),
+            ...(input.position !== undefined && { position: input.position }),
             ...(input.tags && { tags: input.tags }),
             ...(input.notes !== undefined && { notes: input.notes }),
             ...(input.status && { status: input.status }),
+            ...(input.marketingOptIn === true && {
+              whatsappOptInAt: new Date(),
+              whatsappOptInSource: input.marketingOptInSource ?? 'manual',
+              ...(input.marketingOptInProof ? { whatsappOptInProof: input.marketingOptInProof } : {}),
+            }),
+            ...(input.marketingOptIn === false && { optedOutAt: new Date() }),
           },
+          ...(input.marketingOptIn === true ? { $unset: { optedOutAt: 1 } } : {}),
+          ...(input.marketingOptIn === false ? { $unset: { whatsappOptInAt: 1, whatsappOptInSource: 1, whatsappOptInProof: 1 } } : {}),
         },
         { new: true }
       );
@@ -188,6 +297,11 @@ export async function contactsRoutes(fastify: FastifyInstance): Promise<void> {
         );
       }
 
+      if (input.status) {
+        const STATUS_LABEL: Record<string, string> = { active: "reativado", blocked: "bloqueado", archived: "arquivado" };
+        void logContactAudit(workspaceId, sub, id, "contact.updated", `Contato ${STATUS_LABEL[input.status] ?? input.status}`);
+      }
+
       reply.send(toContactResponse(contact));
     } catch (err) {
       fastify.log.error(err);
@@ -195,7 +309,7 @@ export async function contactsRoutes(fastify: FastifyInstance): Promise<void> {
     }
   });
 
-  fastify.delete<{ Params: { id: string } }>("/:id", auth, async (request, reply) => {
+  fastify.delete<{ Params: { id: string } }>("/:id", canDelete, async (request, reply) => {
     try {
       const { workspaceId } = request.user as { workspaceId: string };
       const { id } = request.params;
@@ -216,9 +330,61 @@ export async function contactsRoutes(fastify: FastifyInstance): Promise<void> {
     }
   });
 
-  fastify.post<{ Params: { id: string }; Body: { tag: string } }>("/:id/tags", auth, async (request, reply) => {
+  // POST /api/contacts/:id/merge — merge duplicate contacts into :id (the
+  // survivor); sourceIds are folded in and deleted. Same role gate as DELETE
+  // /:id since this permanently removes the source contacts.
+  fastify.post<{ Params: { id: string }; Body: { sourceIds?: string[] } }>("/:id/merge", canDelete, async (request, reply) => {
     try {
-      const { workspaceId } = request.user as { workspaceId: string };
+      const { workspaceId, sub } = request.user as { workspaceId: string; sub?: string };
+      const { id } = request.params;
+      const sourceIds = (request.body.sourceIds ?? []).filter((sid) => Types.ObjectId.isValid(sid) && sid !== id);
+
+      if (!Types.ObjectId.isValid(id)) return reply.status(400).send({ error: "Invalid contact ID" });
+      if (sourceIds.length === 0) return reply.status(400).send({ error: "sourceIds é obrigatório" });
+
+      const wsId = new Types.ObjectId(workspaceId);
+      const primary = await Contact.findOne({ _id: id, workspaceId: wsId });
+      if (!primary) return reply.status(404).send({ error: "Contact not found" });
+
+      const sources = await Contact.find({ _id: { $in: sourceIds }, workspaceId: wsId });
+      if (sources.length === 0) return reply.status(404).send({ error: "Nenhum contato duplicado encontrado" });
+
+      // Union tags, fill blank scalar fields, append secondary notes.
+      const tagSet = new Set(primary.tags ?? []);
+      const noteLines: string[] = [];
+      for (const s of sources) {
+        for (const t of s.tags ?? []) tagSet.add(t);
+        if (!primary.email && s.email) primary.email = s.email;
+        if (!primary.company && s.company) primary.company = s.company;
+        if (!primary.position && s.position) primary.position = s.position;
+        if (s.notes?.trim()) noteLines.push(s.notes.trim());
+      }
+      primary.tags = [...tagSet];
+      if (noteLines.length) primary.notes = [primary.notes?.trim(), ...noteLines].filter(Boolean).join("\n---\n");
+      await primary.save();
+
+      // Reassign every relation that points at a merged-away contact.
+      const sourceObjectIds = sources.map((s) => s._id);
+      await Promise.all([
+        Conversation.updateMany({ workspaceId: wsId, contactId: { $in: sourceObjectIds } }, { $set: { contactId: primary._id } }),
+        Lead.updateMany({ workspaceId: wsId, contactId: { $in: sourceObjectIds } }, { $set: { contactId: primary._id } }),
+        CampaignRecipient.updateMany({ contactId: { $in: sourceObjectIds } }, { $set: { contactId: primary._id } }),
+      ]);
+
+      await Contact.deleteMany({ _id: { $in: sourceObjectIds } });
+
+      void logContactAudit(workspaceId, sub, id, "contact.updated", `Mesclado com ${sources.length} contato(s) duplicado(s)`);
+
+      reply.send(toContactResponse(primary));
+    } catch (err) {
+      fastify.log.error(err);
+      reply.status(400).send({ error: "Invalid request" });
+    }
+  });
+
+  fastify.post<{ Params: { id: string }; Body: { tag: string } }>("/:id/tags", canWrite, async (request, reply) => {
+    try {
+      const { workspaceId, sub } = request.user as { workspaceId: string; sub?: string };
       const { id } = request.params;
       const { tag } = request.body;
 
@@ -233,6 +399,7 @@ export async function contactsRoutes(fastify: FastifyInstance): Promise<void> {
       );
 
       if (!contact) return reply.status(404).send({ error: "Contact not found" });
+      void logContactAudit(workspaceId, sub, id, 'contact.updated', `Etiqueta "${tag.trim()}" adicionada`);
       reply.send(toContactResponse(contact));
     } catch (err) {
       fastify.log.error(err);
@@ -240,9 +407,9 @@ export async function contactsRoutes(fastify: FastifyInstance): Promise<void> {
     }
   });
 
-  fastify.delete<{ Params: { id: string; tag: string } }>("/:id/tags/:tag", auth, async (request, reply) => {
+  fastify.delete<{ Params: { id: string; tag: string } }>("/:id/tags/:tag", canWrite, async (request, reply) => {
     try {
-      const { workspaceId } = request.user as { workspaceId: string };
+      const { workspaceId, sub } = request.user as { workspaceId: string; sub?: string };
       const { id, tag } = request.params;
 
       if (!Types.ObjectId.isValid(id)) return reply.status(400).send({ error: "Invalid contact ID" });
@@ -254,6 +421,7 @@ export async function contactsRoutes(fastify: FastifyInstance): Promise<void> {
       );
 
       if (!contact) return reply.status(404).send({ error: "Contact not found" });
+      void logContactAudit(workspaceId, sub, id, 'contact.updated', `Etiqueta "${decodeURIComponent(tag)}" removida`);
       reply.send(toContactResponse(contact));
     } catch (err) {
       fastify.log.error(err);
@@ -261,7 +429,7 @@ export async function contactsRoutes(fastify: FastifyInstance): Promise<void> {
     }
   });
 
-  fastify.post("/batch/tags", auth, async (request, reply) => {
+  fastify.post("/batch/tags", canWrite, async (request, reply) => {
     try {
       const { workspaceId } = request.user as { workspaceId: string };
       const input = BulkTagSchema.parse(request.body);
@@ -342,12 +510,19 @@ export async function contactsRoutes(fastify: FastifyInstance): Promise<void> {
 
       if (!contact) return reply.status(404).send({ error: "Contact not found" });
 
-      const conversations = await Conversation.find({
-        workspaceId: new Types.ObjectId(workspaceId),
-        $or: [{ jid: contact.jid }, { contactId: contact._id }],
-      }).sort({ updatedAt: -1 }).limit(10);
+      const [conversations, auditEntries] = await Promise.all([
+        Conversation.find({
+          workspaceId: new Types.ObjectId(workspaceId),
+          $or: [{ jid: contact.jid }, { contactId: contact._id }],
+        }).sort({ updatedAt: -1 }).limit(10),
+        AuditLog.find({
+          workspaceId: new Types.ObjectId(workspaceId),
+          "target.type": "contact",
+          "target.id": id,
+        }).sort({ createdAt: -1 }).limit(30),
+      ]);
 
-      const activity = conversations.map((conv) => ({
+      const messageActivity = conversations.map((conv) => ({
         id: conv._id.toString(),
         type: "message" as const,
         description: conv.lastMessage?.content || "Conversa iniciada",
@@ -356,6 +531,21 @@ export async function contactsRoutes(fastify: FastifyInstance): Promise<void> {
         actor: { id: "system", name: "Sistema" },
       }));
 
+      // AuditLog.type is 'contact.updated'/'contact.deleted' — map to the
+      // frontend timeline's tag_added/status_changed buckets via the label text.
+      const auditActivity = auditEntries.map((entry) => ({
+        id: entry._id.toString(),
+        type: (entry.target?.label ?? "").startsWith("Etiqueta") ? ("tag_added" as const) : ("status_changed" as const),
+        description: entry.target?.label ?? "Contato atualizado",
+        metadata: entry.metadata ?? {},
+        timestamp: entry.createdAt.toISOString(),
+        actor: { id: entry.actor.id.toString(), name: entry.actor.name },
+      }));
+
+      const activity = [...messageActivity, ...auditActivity].sort(
+        (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+      );
+
       reply.send({ data: activity });
     } catch (err) {
       fastify.log.error(err);
@@ -363,7 +553,7 @@ export async function contactsRoutes(fastify: FastifyInstance): Promise<void> {
     }
   });
 
-  fastify.post("/batch/status", auth, async (request, reply) => {
+  fastify.post("/batch/status", canWrite, async (request, reply) => {
     try {
       const { workspaceId } = request.user as { workspaceId: string };
       const input = BulkStatusSchema.parse(request.body);

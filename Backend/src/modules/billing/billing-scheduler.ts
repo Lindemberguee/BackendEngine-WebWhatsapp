@@ -1,5 +1,5 @@
 import type { WebSocketGateway } from '../../ws/gateway';
-import { expireDueTrials } from './billing.service';
+import { expireDueCancellations, expireDueTrials } from './billing.service';
 import pino from 'pino';
 
 const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' });
@@ -8,7 +8,8 @@ let timer: ReturnType<typeof setInterval> | null = null;
 
 export function startBillingScheduler(wsGateway: WebSocketGateway): void {
   if (timer) return;
-  const tick = () => expireDueTrials(wsGateway).catch((err) => logger.error({ err }, '[billing] scheduler tick failed'));
+  const tick = () => Promise.all([expireDueTrials(wsGateway), expireDueCancellations(wsGateway)])
+    .catch((err) => logger.error({ err }, '[billing] scheduler tick failed'));
   timer = setInterval(tick, TICK_MS);
   tick(); // catch anything due since the last restart
   logger.info('[billing] scheduler started');

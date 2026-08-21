@@ -8,6 +8,10 @@ const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' });
 
 const TICK_MS = 4_000;
 let timer: ReturnType<typeof setInterval> | null = null;
+// Re-entrancy guard — see the atomic recipient claim in campaign.service.ts's
+// sendNextRecipient for the other half of this fix (this flag alone doesn't
+// close every race, since a tick can span multiple campaigns/recipients).
+let running = false;
 
 function randomDelaySeconds(min: number, max: number): number {
   const lo = Math.min(min, max), hi = Math.max(min, max);
@@ -32,6 +36,16 @@ export function stopCampaignDispatcher(): void {
 }
 
 async function tick(sessionManager: SessionManager, gateway: WebSocketGateway): Promise<void> {
+  if (running) return;
+  running = true;
+  try {
+    await runTick(sessionManager, gateway);
+  } finally {
+    running = false;
+  }
+}
+
+async function runTick(sessionManager: SessionManager, gateway: WebSocketGateway): Promise<void> {
   const now = new Date();
 
   // Promote due scheduled campaigns to sending.

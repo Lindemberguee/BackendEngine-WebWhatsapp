@@ -19,12 +19,19 @@ export type CrmTriggerEvent = 'stage_changed' | 'won' | 'lost';
 export async function triggerCrmFlow(
   sessionManager: SessionManager,
   workspaceId: string,
-  lead: Pick<ILead, 'conversationId' | 'pipelineId' | 'stageId'>,
+  lead: Pick<ILead, 'conversationId' | 'pipelineId' | 'stageId' | 'contactId'>,
   event: CrmTriggerEvent
 ): Promise<void> {
   try {
-    if (!lead.conversationId) return;
-    const conversation = await Conversation.findById(lead.conversationId).lean();
+    let conversation = lead.conversationId ? await Conversation.findById(lead.conversationId).lean() : null;
+    // Manual/no-conversation leads still have a contactId — fall back to that
+    // contact's most recent conversation (if any) rather than giving up
+    // outright. This doesn't run a flow without a real WhatsApp channel; it
+    // just stops requiring that the channel be *this specific* lead's own
+    // conversationId.
+    if (!conversation && lead.contactId) {
+      conversation = await Conversation.findOne({ workspaceId, contactId: lead.contactId }).sort({ updatedAt: -1 }).lean();
+    }
     if (!conversation?.instanceId) return;
 
     // Don't step on an already-active flow for this conversation.

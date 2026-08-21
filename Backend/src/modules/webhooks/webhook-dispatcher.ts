@@ -12,6 +12,10 @@ const REQUEST_TIMEOUT_MS = 8_000;
 const BACKOFF_MS = [60_000, 300_000];
 
 let timer: ReturnType<typeof setInterval> | null = null;
+// Re-entrancy guard — a batch of 20 deliveries at up to 8s each can outlast the
+// 5s tick interval; without this, an overlapping tick re-fetches the same
+// still-`pending` rows and POSTs the customer's endpoint twice for one event.
+let running = false;
 
 /** HMAC-SHA256 signature of a delivery body — pulled out for direct unit testing. */
 export function signPayload(secret: string, body: string): string {
@@ -36,13 +40,19 @@ export function stopWebhookDispatcher(): void {
 }
 
 async function tick(): Promise<void> {
-  const due = await WebhookDelivery.find({ status: 'pending', nextAttemptAt: { $lte: new Date() } }).limit(BATCH_SIZE);
-  for (const delivery of due) {
-    try {
-      await deliver(delivery);
-    } catch (err) {
-      logger.warn({ err, deliveryId: delivery._id }, '[webhooks] delivery attempt threw unexpectedly');
+  if (running) return;
+  running = true;
+  try {
+    const due = await WebhookDelivery.find({ status: 'pending', nextAttemptAt: { $lte: new Date() } }).limit(BATCH_SIZE);
+    for (const delivery of due) {
+      try {
+        await deliver(delivery);
+      } catch (err) {
+        logger.warn({ err, deliveryId: delivery._id }, '[webhooks] delivery attempt threw unexpectedly');
+      }
     }
+  } finally {
+    running = false;
   }
 }
 
@@ -69,6 +79,11 @@ async function deliver(delivery: InstanceType<typeof WebhookDelivery>): Promise<
       },
       body,
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      // Don't auto-follow redirects: the target URL passed isPublicHttpUrl() at
+      // creation time, but a 3xx response body is attacker-controlled once the URL
+      // belongs to a customer's own webhook receiver — following it would let a
+      // "public" URL redirect straight to an internal address (SSRF via redirect).
+      redirect: 'manual',
     });
 
     if (res.ok) {

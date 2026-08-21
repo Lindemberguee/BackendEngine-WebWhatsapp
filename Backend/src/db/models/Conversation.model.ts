@@ -7,6 +7,8 @@ export interface ILastMessage {
   type: string;
   direction: 'inbound' | 'outbound';
   timestamp: Date;
+  /** Group messages only — who sent it, so the list preview can show "João: texto". */
+  senderName?: string;
 }
 
 export interface IGroupParticipant {
@@ -51,6 +53,10 @@ export interface IConversation extends Document {
   lastMessage?: ILastMessage;
   isGroup: boolean;
   groupInfo?: IGroupInfo;         // Only for isGroup=true
+  /** Group conversations only — lets the bot run in this specific group even when the
+   *  matching flow's trigger doesn't have allowGroups on workspace-wide. Default off:
+   *  the bot never runs in a group unless explicitly turned on here. */
+  allowBotInGroups?: boolean;
   chatMetadata?: IChatMetadata;   // Archived, pinned, muted status
   snoozedUntil?: Date;
   contactId?: Types.ObjectId;
@@ -67,6 +73,14 @@ export interface IConversation extends Document {
   resolutionDueAt?: Date;
   slaFirstResponseBreached: boolean;
   slaResolutionBreached: boolean;
+  /** Set when a conversation is resolved (manually or by a flow) — the reason itself is optional. */
+  closeReasonId?: Types.ObjectId;
+  resolvedAt?: Date;
+  /** Timestamp of the last message FROM the contact (inbound only — unlike
+   *  `lastMessage.timestamp`, which also advances on our own outbound sends).
+   *  Cloud API channel only: enforces the 24h free-form messaging window —
+   *  outside it, only an approved template can be sent. See CloudApiSession.sendMessage. */
+  lastInboundAt?: Date;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -84,12 +98,14 @@ const ConversationSchema = new Schema<IConversation>(
     unreadCount:      { type: Number, default: 0, min: 0 },
     tags:             [{ type: String }],
     lastMessage: {
-      content:   { type: String },
-      type:      { type: String },
-      direction: { type: String, enum: ['inbound', 'outbound'] },
-      timestamp: { type: Date },
+      content:    { type: String },
+      type:       { type: String },
+      direction:  { type: String, enum: ['inbound', 'outbound'] },
+      timestamp:  { type: Date },
+      senderName: { type: String },
     },
     isGroup:      { type: Boolean, default: false },
+    allowBotInGroups: { type: Boolean, default: false },
     groupInfo: {
       subject:         { type: String },
       picture:         { type: String },
@@ -125,19 +141,42 @@ const ConversationSchema = new Schema<IConversation>(
     resolutionDueAt:    { type: Date },
     slaFirstResponseBreached: { type: Boolean, default: false },
     slaResolutionBreached:    { type: Boolean, default: false },
+    closeReasonId: { type: Schema.Types.ObjectId, ref: 'CloseReason' },
+    resolvedAt:    { type: Date },
+    lastInboundAt: { type: Date },
   },
   { timestamps: true }
 );
 
 ConversationSchema.index({ workspaceId: 1, status: 1 });
 ConversationSchema.index({ workspaceId: 1, instanceId: 1, jid: 1 }, { unique: true, sparse: true });
-ConversationSchema.index({ workspaceId: 1, jid: 1 }, { unique: true, sparse: true });  // For manual conversations without instanceId
+ConversationSchema.index({ workspaceId: 1, jid: 1 }); // Shared-contact history lookup; conversations stay isolated per instance.
 ConversationSchema.index({ workspaceId: 1, assignedAgentId: 1 });
 ConversationSchema.index({ workspaceId: 1, teamGroupId: 1 });
 ConversationSchema.index({ workspaceId: 1, attendanceMode: 1 });
 ConversationSchema.index({ updatedAt: -1 });
 ConversationSchema.index({ workspaceId: 1, slaFirstResponseBreached: 1, firstResponseDueAt: 1 });
 ConversationSchema.index({ workspaceId: 1, slaResolutionBreached: 1, resolutionDueAt: 1 });
+// Covers GET /api/conversations's actual query shape: filtered by workspace + archived
+// flag, sorted by updatedAt — the old global `{ updatedAt: -1 }` index above isn't
+// workspace-prefixed, so this exact (and most common) query fell back to an in-memory
+// sort across every matching document instead of a covered index scan.
+ConversationSchema.index({ workspaceId: 1, 'chatMetadata.archived': 1, updatedAt: -1 });
+// Covers the lazy snooze-expiry sweep (conversations.routes.ts's GET /) — status +
+// snoozedUntil range together, not just status alone.
+ConversationSchema.index({ workspaceId: 1, status: 1, snoozedUntil: 1 });
+// Covers the `?tag=` filter on the same listing route.
+ConversationSchema.index({ workspaceId: 1, tags: 1 });
+// Covers instances.service.ts's countDocuments({instanceId}) per-instance stat —
+// the existing {workspaceId,instanceId,jid} unique index requires jid too, so it
+// doesn't serve an instanceId-only count.
+ConversationSchema.index({ instanceId: 1 });
+// Covers reports.service.ts's and scheduled-event-trigger.ts's workspace + date-range
+// queries (created-in-period, resolved-in-period) — same reasoning as Message's
+// {workspaceId,createdAt} index above: without these, those queries fetch every
+// conversation in the workspace to filter the date in memory.
+ConversationSchema.index({ workspaceId: 1, createdAt: -1 });
+ConversationSchema.index({ workspaceId: 1, resolvedAt: -1 });
 
 ConversationSchema.set('toJSON', {
   virtuals: true,

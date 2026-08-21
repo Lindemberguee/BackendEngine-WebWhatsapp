@@ -3,12 +3,13 @@ import pino from 'pino';
 import { Flow, FlowRun, Conversation, Contact } from '../db/models';
 import type { IFlow, IFlowNode, IFlowRun, UserRole } from '../db/models';
 import { ensureLabel } from '../modules/labels/labels.service';
-import { createLeadFromFlow, moveLeadForContact, assignLeadForContact, updateLeadValueForContact, addLeadNoteForContact } from '../modules/crm/crm.service';
+import { createLeadFromFlow, moveLeadForContact, assignLeadForContact, updateLeadValueForContact, addLeadNoteForContact, getOpenLeadStageName } from '../modules/crm/crm.service';
 import { notify, notifyMany, resolveNotificationTargets, type NotificationTargetType } from '../modules/notifications/notification.service';
 import { getAutoRouteMode, routeConversation } from '../modules/routing/routing.service';
 import { clearSlaTimers } from '../modules/routing/sla.service';
 import { normalizeNodes, normalizeEdges, nodeById, nextNodeId, entryNode } from './graph';
 import { buildMessageContent, interpolate, type FlowContext } from './senders';
+import { isPublicHttpUrl } from '../shared/url-security';
 import type { AnyMessageContent } from '@webwhatsapp/engine';
 import type { WebSocketGateway } from '../ws/gateway';
 
@@ -22,7 +23,28 @@ export interface RunnerDeps {
   wsGateway?: WebSocketGateway;
 }
 
-const MAX_STEPS = 50; // guard against loops per advance() call
+const MAX_STEPS_PER_CALL = 50; // guard against tight loops within a single advance() call
+// Cumulative budget across a run's whole lifetime (persisted on the FlowRun doc, so
+// it survives across delay/waiting resumes, unlike MAX_STEPS_PER_CALL). Without this,
+// a cycle in the graph that passes through a delay/typing block resets its step
+// count on every continuation and runs — and sends messages to the customer —
+// forever. 300 is generous for any legitimate flow (the biggest real ones here are
+// a few dozen nodes) while still bounding a runaway loop to a few hundred messages
+// instead of infinite.
+const MAX_TOTAL_STEPS = 300;
+// automation.jump_flow starts a brand-new FlowRun (own stepCount budget), so a cycle
+// of jumps (A → B → A → …) isn't caught by MAX_TOTAL_STEPS alone — each hop resets
+// it. This caps how many jumps can chain before a run refuses to start.
+const MAX_JUMP_DEPTH = 8;
+
+// Guards against the same FlowRun being walked twice concurrently. Without this,
+// two near-simultaneous inbound events for one conversation (e.g. a fast double
+// message, or a resume() and a start() overlapping) can each read the run before
+// either saves, and both independently advance it — every side-effecting block
+// they pass through (notably notification.send, but also message sends) fires
+// twice. A new FlowRunner is constructed per call site, so this must be
+// module-level, not an instance field, to actually cover concurrent callers.
+const advancingRuns = new Set<string>();
 
 // Which blocks pause the flow waiting for a user selection, and their port ids.
 function waitingPorts(node: IFlowNode): string[] | null {
@@ -96,7 +118,20 @@ function evalInputFormat(node: IFlowNode, ctx: FlowContext): boolean {
     case 'cpf': return isValidCPF(input);
     case 'phone': { const d = input.replace(/\D/g, ''); return d.length >= 10 && d.length <= 15; }
     case 'url': return /^https?:\/\/.+/i.test(input);
-    case 'regex': try { return new RegExp(pattern ?? '').test(input); } catch { return false; }
+    case 'regex': {
+      // A workspace-authored pattern (condition.input_format's regex mode) is run
+      // against text controlled by the end customer. A pattern with catastrophic
+      // backtracking (e.g. `(a+)+$`) can hang the event loop — for this
+      // single-process server that means every workspace's WebSocket, every HTTP
+      // route, and every other WhatsApp session, not just this one flow. There's
+      // no cheap true ReDoS guard without a worker/timeout mechanism, so bound
+      // the blast radius instead: cap both pattern and input length, which is
+      // enough to keep worst-case backtracking in the sub-second range for the
+      // vast majority of catastrophic patterns.
+      const safePattern = (pattern ?? '').slice(0, 200);
+      const safeInput = input.slice(0, 500);
+      try { return new RegExp(safePattern).test(safeInput); } catch { return false; }
+    }
     default: return false;
   }
 }
@@ -137,7 +172,23 @@ export class FlowRunner {
     lastInboundKey?: FlowContext['lastInboundKey'];
     /** Variables inherited from a jump_flow — merged before _lastText so the new flow can still use collected vars. */
     _inheritedVariables?: Record<string, unknown>;
+    /** How many automation.jump_flow hops preceded this start() — 0 for a directly
+     *  triggered run. See MAX_JUMP_DEPTH. */
+    _jumpDepth?: number;
+    /** scheduled trigger only — the anchor timestamp that fired this run, stored so
+     *  the sweep in scheduled-event-trigger.ts can tell it already fired for this
+     *  episode. */
+    _scheduledEventSourceAt?: Date;
   }): Promise<void> {
+    const jumpDepth = params._jumpDepth ?? 0;
+    if (jumpDepth > MAX_JUMP_DEPTH) {
+      logger.error(
+        { workspaceId: params.workspaceId, conversationId: params.conversationId, flowId: flow._id.toString(), jumpDepth },
+        '[flow] refusing to start — jump_flow chain exceeded MAX_JUMP_DEPTH (likely a cycle between flows)'
+      );
+      return;
+    }
+
     const nodes = normalizeNodes(flow);
     const edges = normalizeEdges(flow);
     const entry = entryNode(nodes, edges);
@@ -157,6 +208,8 @@ export class FlowRunner {
       variables: { ...(params._inheritedVariables ?? {}), _lastText: params.lastText ?? '' },
       triggerMessageId: params.triggerMessageId,
       lastInboundMessageId: params.lastInboundKey?.id,
+      jumpDepth,
+      scheduledEventSourceAt: params._scheduledEventSourceAt,
     });
 
     await this.advance(run._id.toString(), params.contact, params.lastInboundKey);
@@ -168,24 +221,84 @@ export class FlowRunner {
    * run stayed waiting — the caller can then decide to re-trigger a fresh flow.
    */
   async resume(run: IFlowRun, reply: { id?: string; text: string; inboundKey?: FlowContext['lastInboundKey'] }): Promise<boolean> {
+    // Atomically claim the run before doing anything else: two near-simultaneous
+    // inbound messages from the same contact could both read this same 'waiting'
+    // document (index.ts's lookup is a plain findOne, not atomic) and, without
+    // this, both would compute the next node and save — executing the branch
+    // twice (duplicate message/lead/notification) or racing each other's writes.
+    // Only the caller that wins this update actually proceeds; the loser sees
+    // `null` and backs off as if the reply hadn't matched.
+    const claimed = await FlowRun.findOneAndUpdate(
+      { _id: run._id, status: 'waiting' },
+      { $set: { status: 'running' } },
+      { new: true }
+    );
+    if (!claimed) return false;
+    run = claimed;
+
     const flow = await Flow.findById(run.flowId);
-    if (!flow) return false;
+    if (!flow) { run.status = 'completed'; await run.save(); return false; }
+    // A disabled flow shouldn't keep advancing runs already in progress — cancel
+    // instead of resuming so the conversation becomes eligible for a fresh trigger.
+    if (!flow.enabled) { run.status = 'cancelled'; await run.save(); return false; }
     const edges = normalizeEdges(flow);
     const waiting = run.waiting;
-    if (!waiting) return false;
+    if (!waiting) { run.status = 'completed'; await run.save(); return false; }
 
+    const nodes = normalizeNodes(flow);
     let port = 'out';
     if (waiting.kind === 'reply') {
-      const nodes = normalizeNodes(flow);
       const node = nodeById(nodes, waiting.nodeId);
       const varName = String((node?.config.variableName as string) ?? '');
-      if (varName) run.variables = { ...run.variables, [varName]: reply.text };
+      if (varName) {
+        run.variables = { ...run.variables, [varName]: reply.text };
+        if (node?.config.persistToContact) void this.persistVariableToContact(run.conversationId, varName, reply.text);
+      }
       // wait_response uses 'resposta' as its success port; save_response uses 'out'.
       if (node?.blockType === 'action.wait_response') port = 'resposta';
     } else if (reply.id && waiting.portIds.includes(reply.id)) {
       port = reply.id;
     } else {
-      // Reply didn't match any option — stay waiting.
+      // Reply didn't match any button/list/CTA option. Previously this just
+      // `return false`d with the run already flipped to 'running' by the atomic
+      // claim above — never reverted, so the run got permanently stuck (it never
+      // actually re-entered 'waiting', silently breaking every subsequent reply
+      // for that conversation). Now: revert the claim, and — when the block opted
+      // into it — nudge the customer and count attempts toward the 'invalid' port.
+      const node = nodeById(nodes, waiting.nodeId);
+      const cfg = (node?.config ?? {}) as { retryOnInvalid?: boolean; maxRetries?: number; invalidMessage?: string };
+      const attempts = (waiting.invalidAttempts ?? 0) + 1;
+      const maxRetries = Math.max(1, Number(cfg.maxRetries) || 2);
+
+      if (cfg.retryOnInvalid && attempts <= maxRetries) {
+        run.waiting = { ...waiting, invalidAttempts: attempts };
+        run.status = 'waiting';
+        await run.save();
+        const nudge = String(cfg.invalidMessage ?? '').trim();
+        if (nudge) {
+          try { await this.deps.sendMessage(run.jid, { text: nudge } as never); } catch { /* ignore */ }
+        }
+        return false;
+      }
+      if (cfg.retryOnInvalid) {
+        // Retries exhausted — follow the dedicated 'invalid' port (typically to a
+        // human handoff or a different message) instead of leaving the customer
+        // stuck in front of a bot that keeps re-asking forever.
+        const invalidNext = nextNodeId(edges, waiting.nodeId, 'invalid');
+        run.waiting = undefined;
+        run.currentNodeId = invalidNext;
+        run.status = invalidNext ? 'running' : 'completed';
+        await run.save();
+        if (invalidNext) {
+          const contact = await this.loadContact(run);
+          await this.advance(run._id.toString(), contact, reply.inboundKey);
+        }
+        return true;
+      }
+      // No retry configured for this block — same behavior as before (keep
+      // waiting for a matching reply), just with the claim correctly reverted.
+      run.status = 'waiting';
+      await run.save();
       return false;
     }
 
@@ -210,23 +323,60 @@ export class FlowRunner {
     return { name: contact?.name ?? conv?.name, phone: conv?.phone, email: contact?.email, company: undefined };
   }
 
-  /** Execute nodes sequentially until the flow waits, delays or ends. */
+  /** Execute nodes sequentially until the flow waits, delays or ends. Guarded so the
+   *  same run can't be walked by two overlapping calls (see `advancingRuns` above). */
   private async advance(runId: string, contact: FlowContext['contact'], lastInboundKey?: FlowContext['lastInboundKey']): Promise<void> {
-    for (let step = 0; step < MAX_STEPS; step++) {
+    if (advancingRuns.has(runId)) {
+      logger.warn({ runId }, '[flow] advance() already in progress for this run — skipping duplicate call');
+      return;
+    }
+    advancingRuns.add(runId);
+    try {
+      await this.advanceLocked(runId, contact, lastInboundKey);
+    } finally {
+      advancingRuns.delete(runId);
+    }
+  }
+
+  private async advanceLocked(runId: string, contact: FlowContext['contact'], lastInboundKey?: FlowContext['lastInboundKey']): Promise<void> {
+    for (let step = 0; step < MAX_STEPS_PER_CALL; step++) {
       const run = await FlowRun.findById(runId);
       if (!run || run.status !== 'running' || !run.currentNodeId) return;
       const flow = await Flow.findById(run.flowId);
       if (!flow) return;
+      if (!flow.enabled) {
+        // The flow was disabled/deleted-and-recreated mid-run — don't keep
+        // advancing (and messaging the customer) for an automation the operator
+        // just turned off.
+        run.status = 'cancelled';
+        await run.save();
+        return;
+      }
+      // Cumulative step budget — persisted on the run itself, so it survives across
+      // delay/waiting resumes (which each start a fresh MAX_STEPS_PER_CALL count).
+      // Without this a cycle that loops through automation.delay/typing runs (and
+      // messages the customer) forever.
+      if (run.stepCount >= MAX_TOTAL_STEPS) {
+        logger.error({ runId, flowId: flow._id.toString() }, '[flow] run exceeded MAX_TOTAL_STEPS — stopping (likely a loop in the graph)');
+        run.status = 'failed';
+        run.failureReason = 'Limite de passos excedido — possível loop no fluxo';
+        await run.save();
+        return;
+      }
+      run.stepCount += 1;
       const nodes = normalizeNodes(flow);
       const edges = normalizeEdges(flow);
       const node = nodeById(nodes, run.currentNodeId);
       if (!node) { run.status = 'completed'; await run.save(); return; }
 
-      const ctx: FlowContext = { variables: run.variables, contact, lastInboundKey };
+      const triggerKey = run.triggerMessageId ? { id: run.triggerMessageId, remoteJid: run.jid, fromMe: false } : undefined;
+      const ctx: FlowContext = { variables: run.variables, contact, lastInboundKey, triggerKey };
+
+      try {
 
       // ── Send message / payment blocks ──────────────────────────────────────
       if (node.blockType.startsWith('message.') || node.blockType.startsWith('payment.')) {
-        const content = buildMessageContent(node, ctx);
+        const content = await buildMessageContent(node, ctx, run.workspaceId.toString());
         if (content) {
           try { await this.deps.sendMessage(run.jid, content); }
           catch (err) {
@@ -256,10 +406,14 @@ export class FlowRunner {
         else if (node.blockType === 'condition.variable') result = evalVariable(node, ctx);
         else if (node.blockType === 'condition.input_format') result = evalInputFormat(node, ctx);
         else {
-          // condition.if — tag conditions need the conversation's live tags.
-          if ((node.config as { field?: string }).field === 'contact_tag') {
+          // condition.if — tag/stage conditions need live data, not something
+          // carried in run.variables.
+          const field = (node.config as { field?: string }).field;
+          if (field === 'contact_tag') {
             const conv = await Conversation.findById(run.conversationId).lean();
             ctx.variables._tags = (conv?.tags ?? []).join(',');
+          } else if (field === 'crm_stage') {
+            ctx.variables._crmStage = await getOpenLeadStageName(run.workspaceId, run.conversationId);
           }
           result = evalCondition(node, ctx);
         }
@@ -280,6 +434,7 @@ export class FlowRunner {
           const value = interpolate(String(node.config.value ?? ''), ctx);
           run.variables = { ...run.variables, [varName]: value };
           await run.save();
+          if (node.config.persistToContact) void this.persistVariableToContact(run.conversationId, varName, value);
         }
         await this.moveNext(run, edges, node.id, 'out');
         continue;
@@ -344,20 +499,29 @@ export class FlowRunner {
         run.waiting = { nodeId: node.id, portIds: [], kind: 'reply', waitingUntil };
         run.status = 'waiting';
         await run.save();
-        // Best-effort in-process timeout scheduler (does not survive restart;
-        // handleInboundForFlows checks waitingUntil on next inbound as a safety net).
+        // Best-effort in-process timer for the common case (fast feel, no need to
+        // wait for the scheduler's next tick). node's setTimeout silently fires
+        // *immediately* if the delay exceeds ~24.8 days (2^31-1 ms overflow) — a
+        // "remind me in 30 days" timeout used to fire the moment it was set. Clamp
+        // the timer itself to a safe window and re-check the real waitingUntil
+        // inside the callback before acting; flow-run-scheduler.ts is the actual
+        // authoritative sweep for anything longer (and for surviving a restart —
+        // this timer doesn't).
         if (waitingUntil) {
-          const delayMs = Math.max(0, waitingUntil.getTime() - Date.now());
+          const SAFE_MAX_TIMEOUT_MS = 20 * 86_400_000; // 20 days, safely under the overflow limit
+          const target = waitingUntil;
+          const delay = Math.max(0, Math.min(target.getTime() - Date.now(), SAFE_MAX_TIMEOUT_MS));
           const runId = run._id.toString();
           const nodeId = node.id;
           setTimeout(async () => {
             try {
+              if (new Date() < target) return; // clamped timer fired early — the scheduler will catch it at the real time
               const r = await FlowRun.findById(runId);
               if (r?.status === 'waiting' && r.waiting?.nodeId === nodeId) {
                 await this.handleTimeout(r, contact, lastInboundKey);
               }
             } catch { /* ignore */ }
-          }, delayMs);
+          }, delay);
         }
         return;
       }
@@ -384,16 +548,32 @@ export class FlowRunner {
         continue;
       }
       if (node.blockType === 'attendance.close') {
+        // Send the configured closing message before finishing — previously
+        // silently ignored, leaving the contact with no closing message at all.
+        const closeMessage = interpolate(String(node.config.message ?? ''), ctx).trim();
+        if (closeMessage) {
+          try { await this.deps.sendMessage(run.jid, { text: closeMessage } as never); } catch { /* ignore */ }
+        }
         // Free the ticket on close too (mirrors the resolve endpoint) so a
         // returning contact is re-triaged / eligible for the catch-all again.
-        await Conversation.updateOne({ _id: run.conversationId }, { status: 'resolved', assignedAgentId: null });
+        const closeReasonId = String(node.config.closeReasonId ?? '');
+        await Conversation.updateOne(
+          { _id: run.conversationId },
+          {
+            status: 'resolved', assignedAgentId: null, resolvedAt: new Date(),
+            ...(Types.ObjectId.isValid(closeReasonId) ? { closeReasonId: new Types.ObjectId(closeReasonId) } : {}),
+          }
+        );
         await clearSlaTimers(run.conversationId.toString());
         run.status = 'completed'; await run.save(); return;
       }
       if (node.blockType === 'attendance.pause') {
         run.status = 'completed'; await run.save(); return; // hand off to a human
       }
-      if (node.blockType === 'attendance.assign_team') {
+      // transfer_queue is the same "route to a team" action as assign_team — the
+      // block used to point at a hardcoded, non-existent "queue" enum that never
+      // did anything in production; it now reads the same teamGroupId shape.
+      if (node.blockType === 'attendance.assign_team' || node.blockType === 'attendance.transfer_queue') {
         const teamGroupId = String(node.config.teamGroupId ?? '');
         if (Types.ObjectId.isValid(teamGroupId)) {
           await Conversation.updateOne(
@@ -462,7 +642,7 @@ export class FlowRunner {
         continue;
       }
       if (node.blockType === 'crm.move_stage') {
-        try { await moveLeadForContact(run.workspaceId, run.conversationId, String(node.config.stageId ?? '')); }
+        try { await moveLeadForContact(run.workspaceId, run.conversationId, String(node.config.stageId ?? ''), String(node.config.pipelineId ?? '') || undefined); }
         catch (err) { logger.warn({ err, node: node.id }, '[flow] move_stage failed'); }
         await this.moveNext(run, edges, node.id, 'out');
         continue;
@@ -535,10 +715,17 @@ export class FlowRunner {
       if (node.blockType === 'automation.delay') {
         const ms = delayMs(node.config);
         const next = nextNodeId(edges, node.id, 'out');
+        if (!next) { run.status = 'completed'; await run.save(); return; }
         run.currentNodeId = next;
-        run.status = next ? 'running' : 'completed';
+        // Previously used an in-process setTimeout clamped to 5 minutes — any
+        // configured delay longer than that (the block supports hours/days) was
+        // silently truncated, and a mid-delay process restart lost the timer
+        // entirely, orphaning the run forever. Persist status='delayed' +
+        // resumeAt instead; flow-run-scheduler.ts sweeps for these on a timer, so
+        // the full configured duration is honored and it survives a restart.
+        run.status = 'delayed';
+        run.resumeAt = new Date(Date.now() + ms);
         await run.save();
-        if (next) setTimeout(() => { this.advance(runId, contact, lastInboundKey).catch(() => {}); }, Math.min(ms, 5 * 60_000));
         return;
       }
 
@@ -562,6 +749,7 @@ export class FlowRunner {
               lastText: String(run.variables._lastText ?? ''),
               lastInboundKey,
               _inheritedVariables: run.variables,
+              _jumpDepth: (run.jumpDepth ?? 0) + 1,
             });
             return;
           } else {
@@ -577,12 +765,23 @@ export class FlowRunner {
       if (node.blockType === 'automation.webhook') {
         const { url, method, headers, body } = node.config as { url?: string; method?: string; headers?: Record<string, string>; body?: string };
         const httpMethod = (method || 'POST').toUpperCase();
+        const resolvedUrl = interpolate(String(url ?? ''), ctx);
+        if (!isPublicHttpUrl(resolvedUrl)) {
+          logger.warn({ node: node.id, url: resolvedUrl }, '[flow] webhook action blocked — URL is not a public http(s) host');
+          await this.moveNext(run, edges, node.id, 'error');
+          continue;
+        }
         try {
-          const res = await fetch(interpolate(String(url ?? ''), ctx), {
+          const res = await fetch(resolvedUrl, {
             method: httpMethod,
             headers: { 'Content-Type': 'application/json', ...(headers ?? {}) },
             body: ['GET', 'HEAD'].includes(httpMethod) ? undefined : interpolate(String(body ?? ''), ctx),
             signal: AbortSignal.timeout(10_000),
+            // See webhook-dispatcher.ts: don't follow redirects — this URL is chosen
+            // by whoever built the flow, and here the attacker also controls the
+            // response body (the flow reads res.ok, but a compromised target can still
+            // redirect this internal-network-capable request to 169.254.169.254/etc).
+            redirect: 'manual',
           });
           await this.moveNext(run, edges, node.id, res.ok ? 'success' : 'error');
         } catch (err) {
@@ -592,8 +791,56 @@ export class FlowRunner {
         continue;
       }
 
-      // ── Passthrough (crm/ai/attendance transfer/trigger) ───────────────────
+      // ── AI (not implemented for real yet — see BlockPalette "Em breve") ─────
+      // ai.classify/ai.sentiment never produce a port literally named 'out' (their
+      // ports are intent slugs / positive-neutral-negative), so without this
+      // branch they'd reach the generic passthrough below, which only knows how
+      // to follow an 'out' edge — find nothing, and silently end the run right
+      // here. Follow whichever edge is actually wired instead of guessing a real
+      // classification result; still no AI call happens, no variable is saved.
+      if (node.blockType === 'ai.ask' || node.blockType === 'ai.classify' || node.blockType === 'ai.sentiment') {
+        const next = edges.find((e) => e.source === node.id)?.target;
+        run.currentNodeId = next;
+        run.status = next ? 'running' : 'completed';
+        await run.save();
+        continue;
+      }
+
+      // ── Passthrough (crm/attendance transfer/trigger) ───────────────────────
       await this.moveNext(run, edges, node.id, 'out');
+
+      } catch (err) {
+        // A node throwing (bad timezone config, malformed regex, a DB write
+        // failing, etc.) previously propagated up to the caller's best-effort
+        // .catch() (BaileysSession's inbound handler), which only logs — leaving
+        // this run stuck at status 'running' forever, silently blocking any new
+        // trigger for this conversation. Mark it failed instead so it's visible
+        // and the conversation can be re-triggered.
+        logger.error({ err, runId, node: node.id, blockType: node.blockType }, '[flow] node threw — marking run failed');
+        try {
+          const failedRun = await FlowRun.findById(runId);
+          if (failedRun && failedRun.status === 'running') {
+            failedRun.status = 'failed';
+            failedRun.failureReason = `Erro no bloco "${node.blockType}": ${err instanceof Error ? err.message : String(err)}`;
+            await failedRun.save();
+          }
+        } catch (saveErr) {
+          logger.error({ saveErr, runId }, '[flow] failed to persist failure status after node error');
+        }
+        return;
+      }
+    }
+
+    // Loop finished all MAX_STEPS_PER_CALL iterations without the flow reaching a
+    // wait/delay/end — previously this just silently returned, leaving the run
+    // 'running' forever (and, because handleInboundForFlows blocks a new trigger
+    // while a run is 'running', permanently deaf to that contact from then on).
+    const exhaustedRun = await FlowRun.findById(runId);
+    if (exhaustedRun && exhaustedRun.status === 'running') {
+      logger.error({ runId }, '[flow] run exceeded MAX_STEPS_PER_CALL in one advance() call — stopping (likely a tight loop with no delay/wait)');
+      exhaustedRun.status = 'failed';
+      exhaustedRun.failureReason = 'Muitos passos consecutivos sem pausa — possível loop no fluxo';
+      await exhaustedRun.save();
     }
   }
 
@@ -606,8 +853,20 @@ export class FlowRunner {
   async handleTimeout(run: IFlowRun, contact: FlowContext['contact'], lastInboundKey?: FlowContext['lastInboundKey']): Promise<void> {
     const waitingNodeId = run.waiting?.nodeId;
     if (!waitingNodeId) { run.status = 'completed'; await run.save(); return; }
+    // Same atomic-claim reasoning as resume() — the in-process setTimeout and the
+    // flow-run scheduler's sweep (or a concurrent resume() from an inbound reply
+    // that arrives at the exact same moment) can all race to fire this. Only the
+    // caller that wins the claim proceeds.
+    const claimed = await FlowRun.findOneAndUpdate(
+      { _id: run._id, status: 'waiting', 'waiting.nodeId': waitingNodeId },
+      { $set: { status: 'running' } },
+      { new: true }
+    );
+    if (!claimed) return;
+    run = claimed;
     const flow = await Flow.findById(run.flowId);
     if (!flow) { run.status = 'completed'; await run.save(); return; }
+    if (!flow.enabled) { run.status = 'cancelled'; await run.save(); return; }
     const nodes = normalizeNodes(flow);
     const edges = normalizeEdges(flow);
     const node = nodeById(nodes, waitingNodeId);
@@ -622,6 +881,33 @@ export class FlowRunner {
     run.status = next ? 'running' : 'completed';
     await run.save();
     if (next) await this.advance(run._id.toString(), contact, lastInboundKey);
+  }
+
+  /**
+   * Resume a run parked in status='delayed' (automation.delay past its resumeAt) —
+   * called by flow-run-scheduler.ts's sweep. Atomically claims the run first so a
+   * scheduler tick can't double-process a run the in-process continuation (when the
+   * delay was short enough to use one) already picked up, or vice versa.
+   */
+  async continueDelayed(runId: string): Promise<void> {
+    const claimed = await FlowRun.findOneAndUpdate(
+      { _id: runId, status: 'delayed' },
+      { $set: { status: 'running' } },
+      { new: true }
+    );
+    if (!claimed) return;
+    const contact = await this.loadContact(claimed);
+    await this.advance(runId, contact);
+  }
+
+  /** Fire a wait_response timeout found by the scheduler's sweep (safety net for
+   *  when the in-process timer didn't survive a restart, or was clamped short of
+   *  the real target — see action.wait_response above). */
+  async continueTimedOut(runId: string): Promise<void> {
+    const run = await FlowRun.findById(runId);
+    if (!run || run.status !== 'waiting') return;
+    const contact = await this.loadContact(run);
+    await this.handleTimeout(run, contact);
   }
 
   private async moveNext(run: IFlowRun, edges: ReturnType<typeof normalizeEdges>, nodeId: string, port: string) {
@@ -642,6 +928,18 @@ export class FlowRunner {
       await Contact.updateOne({ _id: conv.contactId }, { $pull: { tags: tag } });
       await Conversation.updateOne({ _id: conv._id }, { $pull: { tags: tag } });
     }
+  }
+
+  /** Mirrors a flow variable into the contact's customFields — used when a
+   *  "Definir Variável"/"Salvar Resposta"/"Aguardar Resposta" block has
+   *  `persistToContact` on, so the value survives past this one run instead of
+   *  only living in `run.variables` for the duration of this flow. Same target
+   *  action.update_field already writes to. */
+  private async persistVariableToContact(conversationId: Types.ObjectId, varName: string, value: string) {
+    try {
+      const conv = await Conversation.findById(conversationId).select('contactId').lean();
+      if (conv?.contactId) await Contact.updateOne({ _id: conv.contactId }, { $set: { [`customFields.${varName}`]: value } });
+    } catch (err) { logger.warn({ err, varName }, '[flow] persistVariableToContact failed'); }
   }
 }
 

@@ -66,13 +66,17 @@ const makeGroupsSocket = (config) => {
     }
 
     suki.ws.on('CB:ib,,dirty', async (node) => {
-        const { attrs } = WABinary_1.getBinaryNodeChild(node, 'dirty')
-        if (attrs.type !== 'groups') {
+      try {
+        const dirtyNode = WABinary_1.getBinaryNodeChild(node, 'dirty')
+        if (!dirtyNode || dirtyNode.attrs.type !== 'groups') {
             return
         }
 
         await groupFetchAllParticipating()
         await suki.cleanDirtyBits('groups')
+      } catch (err) {
+        suki.onUnexpectedError(err, 'handling dirty sync (groups)')
+      }
     })
 
     return {

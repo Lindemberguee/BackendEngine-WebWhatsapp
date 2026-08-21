@@ -1,36 +1,57 @@
-version: '3.9'
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: '10m'
+    max-file: '5'
 
 services:
   mongodb:
-    image: mongo:7
+    image: mongo:7.0
     container_name: webwhatsapp-mongo
     restart: unless-stopped
     ports:
-      - '27017:27017'
+      # Loopback-only access keeps host-side backup/restore scripts working.
+      - '127.0.0.1:27017:27017'
     environment:
       MONGO_INITDB_DATABASE: webwhatsapp
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USERNAME:?set MONGO_ROOT_USERNAME in .env}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?set MONGO_ROOT_PASSWORD in .env}
+      MONGO_APP_USERNAME: ${MONGO_APP_USERNAME:?set MONGO_APP_USERNAME in .env}
+      MONGO_APP_PASSWORD: ${MONGO_APP_PASSWORD:?set MONGO_APP_PASSWORD in .env}
     volumes:
       - mongo_data:/data/db
+      - ./scripts/mongo-init.js:/docker-entrypoint-initdb.d/10-create-app-user.js:ro
     healthcheck:
-      test: ['CMD', 'mongosh', '--eval', "db.adminCommand('ping')"]
+      test:
+        - CMD-SHELL
+        - >-
+          mongosh --quiet --username "$$MONGO_INITDB_ROOT_USERNAME"
+          --password "$$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin
+          --eval "db.adminCommand('ping').ok" | grep 1
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 20s
+    logging: *default-logging
 
   mongo-express:
     image: mongo-express:1
     container_name: webwhatsapp-mongo-ui
     restart: unless-stopped
     ports:
-      - '8081:8081'
+      - '127.0.0.1:8081:8081'
     environment:
       ME_CONFIG_MONGODB_SERVER: mongodb
-      ME_CONFIG_BASICAUTH_USERNAME: admin
-      ME_CONFIG_BASICAUTH_PASSWORD: admin123
+      ME_CONFIG_MONGODB_ADMINUSERNAME: ${MONGO_ROOT_USERNAME:?set MONGO_ROOT_USERNAME in .env}
+      ME_CONFIG_MONGODB_ADMINPASSWORD: ${MONGO_ROOT_PASSWORD:?set MONGO_ROOT_PASSWORD in .env}
+      ME_CONFIG_MONGODB_AUTH_DATABASE: admin
+      ME_CONFIG_BASICAUTH_USERNAME: ${MONGO_EXPRESS_USERNAME:-admin}
+      ME_CONFIG_BASICAUTH_PASSWORD: ${MONGO_EXPRESS_PASSWORD:-change-me-in-dev}
     depends_on:
       mongodb:
         condition: service_healthy
     profiles: ['dev']
+    logging: *default-logging
 
   # Production-shaped build of the API. Build context is the workspace root
   # (`..`, i.e. E:\Baileys) because @webwhatsapp/engine is a sibling npm
@@ -41,19 +62,48 @@ services:
       dockerfile: Backend/Dockerfile
     container_name: webwhatsapp-backend
     restart: unless-stopped
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     ports:
-      - '3333:3333'
+      # Keep the API private on the VM; publish it through Nginx/Caddy with TLS.
+      - '127.0.0.1:3333:3333'
     environment:
       NODE_ENV: production
       PORT: 3333
       HOST: 0.0.0.0
-      MONGODB_URI: mongodb://mongodb:27017/webwhatsapp
+      MONGODB_URI: mongodb://${MONGO_APP_USERNAME:?set MONGO_APP_USERNAME in .env}:${MONGO_APP_PASSWORD:?set MONGO_APP_PASSWORD in .env}@mongodb:27017/webwhatsapp?authSource=webwhatsapp
       JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env before running in production}
+      CREDENTIALS_ENCRYPTION_KEY: ${CREDENTIALS_ENCRYPTION_KEY:?set CREDENTIALS_ENCRYPTION_KEY in .env before running in production}
       CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3000}
+      PUBLIC_API_URL: ${PUBLIC_API_URL:?set PUBLIC_API_URL to the public HTTPS API origin}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      SENTRY_DSN: ${SENTRY_DSN:-}
+      PLATFORM_ADMIN_API_KEY: ${PLATFORM_ADMIN_API_KEY:-}
+      META_GRAPH_VERSION: ${META_GRAPH_VERSION:-v25.0}
+      META_APP_ID: ${META_APP_ID:-}
+      META_APP_SECRET: ${META_APP_SECRET:-}
+      META_WEBHOOK_VERIFY_TOKEN: ${META_WEBHOOK_VERIFY_TOKEN:-}
+      META_EMBEDDED_SIGNUP_CONFIG_ID: ${META_EMBEDDED_SIGNUP_CONFIG_ID:-}
+      MEDIA_STORAGE_DRIVER: ${MEDIA_STORAGE_DRIVER:-local}
+      MEDIA_LOCAL_DIR: /app/data/media
+      MEDIA_R2_ACCOUNT_ID: ${MEDIA_R2_ACCOUNT_ID:-}
+      MEDIA_S3_BUCKET: ${MEDIA_S3_BUCKET:-}
+      MEDIA_S3_REGION: ${MEDIA_S3_REGION:-auto}
+      MEDIA_S3_ENDPOINT: ${MEDIA_S3_ENDPOINT:-}
+      MEDIA_S3_ACCESS_KEY_ID: ${MEDIA_S3_ACCESS_KEY_ID:-}
+      MEDIA_S3_SECRET_ACCESS_KEY: ${MEDIA_S3_SECRET_ACCESS_KEY:-}
+      MEDIA_S3_FORCE_PATH_STYLE: ${MEDIA_S3_FORCE_PATH_STYLE:-false}
+    volumes:
+      - media_data:/app/data/media
     depends_on:
       mongodb:
         condition: service_healthy
+    stop_grace_period: 45s
+    logging: *default-logging
 
 volumes:
   mongo_data:
+  media_data:

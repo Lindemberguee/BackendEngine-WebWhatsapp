@@ -89,6 +89,13 @@ export async function updateAgent(
   if (!user) throw new Error('Usuário não encontrado');
   if (user.role === 'owner') throw new Error('O proprietário não pode ser alterado');
   if (user._id!.toString() === actorId && data.isActive === false) throw new Error('Você não pode desativar a si mesmo');
+  // assertCanCreateAgent only guards createAgent — reactivating a deactivated agent
+  // is the same "one more active seat" event and was bypassing the cap entirely:
+  // create up to the limit, deactivate one, create another (passes, since the
+  // deactivated one doesn't count), then reactivate the first — over the limit.
+  if (data.isActive === true && !user.isActive) {
+    await assertCanCreateAgent(workspaceId);
+  }
 
   const changes: Record<string, unknown> = {};
   if (data.name !== undefined) { user.name = data.name.trim(); changes.name = data.name.trim(); }
@@ -100,6 +107,13 @@ export async function updateAgent(
   if (data.isActive !== undefined) { user.isActive = data.isActive; changes.isActive = data.isActive; }
   if (typeof data.maxConcurrentChats === 'number' && data.maxConcurrentChats >= 0) {
     user.maxConcurrentChats = data.maxConcurrentChats; changes.maxConcurrentChats = data.maxConcurrentChats;
+  }
+  // A role change or deactivation must invalidate any JWT already issued to this
+  // user — otherwise their old token keeps working with the old (higher, or
+  // simply still-active) privileges until it naturally expires. Same mechanism
+  // already used for password changes (see hashPassword below).
+  if (changes.newRole !== undefined || changes.isActive !== undefined) {
+    user.tokenVersion += 1;
   }
   await user.save();
 
@@ -155,6 +169,9 @@ export async function resetAgentPassword(
   const user = await User.findOne({ _id: id, workspaceId: new Types.ObjectId(workspaceId) });
   if (!user) throw new Error('Usuário não encontrado');
   if (user._id!.toString() === actorId) throw new Error('Use o perfil para alterar sua própria senha');
+  // Same guard as updateAgent/removeAgent: without it, an admin can reset the
+  // owner's password and sign in as them — the one role update/removal can't touch.
+  if (user.role === 'owner') throw new Error('O proprietário não pode ser alterado');
 
   // The pre-save hook hashes the password. Also bump tokenVersion so any session
   // signed in with the old password is invalidated immediately.

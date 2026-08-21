@@ -18,9 +18,15 @@ export async function getAutoRouteMode(workspaceId: string): Promise<AutoRouteMo
   return mode === 'on_new' || mode === 'off' ? mode : 'on_human';
 }
 
-/** Live count of open/pending conversations currently assigned to an agent — not persisted, computed on demand. */
-async function liveLoad(workspaceId: string, agentId: Types.ObjectId): Promise<number> {
-  return Conversation.countDocuments({ workspaceId, assignedAgentId: agentId, status: { $in: ['open', 'pending'] } });
+/** Live open/pending conversation count per agent, for a whole candidate set in one
+ *  query — not persisted, computed on demand. Previously one countDocuments() per
+ *  candidate (N+1: every routing decision fired one query per eligible agent). */
+async function liveLoadByAgent(workspaceId: string, agentIds: Types.ObjectId[]): Promise<Map<string, number>> {
+  const rows = await Conversation.aggregate<{ _id: Types.ObjectId; count: number }>([
+    { $match: { workspaceId: new Types.ObjectId(workspaceId), assignedAgentId: { $in: agentIds }, status: { $in: ['open', 'pending'] } } },
+    { $group: { _id: '$assignedAgentId', count: { $sum: 1 } } },
+  ]);
+  return new Map(rows.map((r) => [r._id.toString(), r.count]));
 }
 
 /** Queue-level business hours win; falls back to the workspace default; absent config means always-on. */
@@ -77,13 +83,12 @@ export async function pickAgent(workspaceId: string, teamGroupId?: string | null
   const candidates = await User.find(candidateFilter).select('_id maxConcurrentChats').lean();
   if (!candidates.length) return null;
 
-  const withLoad = await Promise.all(
-    candidates.map(async (u) => ({
-      id: u._id as Types.ObjectId,
-      max: u.maxConcurrentChats ?? 0,
-      load: await liveLoad(workspaceId, u._id as Types.ObjectId),
-    }))
-  );
+  const loadByAgent = await liveLoadByAgent(workspaceId, candidates.map((u) => u._id as Types.ObjectId));
+  const withLoad = candidates.map((u) => ({
+    id: u._id as Types.ObjectId,
+    max: u.maxConcurrentChats ?? 0,
+    load: loadByAgent.get((u._id as Types.ObjectId).toString()) ?? 0,
+  }));
   const eligible = withLoad.filter((c) => c.max === 0 || c.load < c.max);
   if (!eligible.length) return null;
 

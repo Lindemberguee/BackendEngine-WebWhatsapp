@@ -31,6 +31,9 @@ export interface IMessage extends Document {
   direction: 'inbound' | 'outbound';
   type: MessageType;
   status: MessageStatus;
+  providerError?: { code?: number; title?: string; message?: string; details?: string };
+  providerReadAt?: Date;
+  mediaStorage?: { key: string; provider: 'local' | 's3'; mimeType: string; fileName?: string; size: number; sha256: string; archivedAt: Date };
   fromMe: boolean;
   reactions?: IReaction[]; // Emoji reactions on this message
   // Polymorphic content per type
@@ -109,6 +112,22 @@ const MessageSchema = new Schema<IMessage>(
     direction:      { type: String, enum: ['inbound', 'outbound'], required: true },
     type:           { type: String, enum: ['text','image','video','audio','document','sticker','location','contact','poll','interactive','reaction','system','unknown'], default: 'text' },
     status:         { type: String, enum: ['pending','sent','delivered','read','failed','deleted'], default: 'sent' },
+    providerError: {
+      code: Number,
+      title: String,
+      message: String,
+      details: String,
+    },
+    providerReadAt: { type: Date },
+    mediaStorage: {
+      key: String,
+      provider: { type: String, enum: ['local', 's3'] },
+      mimeType: String,
+      fileName: String,
+      size: Number,
+      sha256: String,
+      archivedAt: Date,
+    },
     fromMe:         { type: Boolean, required: true },
     content:        { type: Schema.Types.Mixed, default: {} },
     quoted: {
@@ -134,8 +153,24 @@ const MessageSchema = new Schema<IMessage>(
 );
 
 MessageSchema.index({ conversationId: 1, createdAt: -1 });
+// Covers analytics.routes.ts's workspace + date-range aggregates (overview totals,
+// daily trend, today's count) — without this, {workspaceId,messageId} is the only
+// usable index for those queries, which only serves the equality match on
+// workspaceId and falls back to fetching every document in the workspace to filter
+// createdAt in memory. With 1M+ messages that's the difference between an
+// index-bounded range scan and a full workspace scan on every dashboard load.
+MessageSchema.index({ workspaceId: 1, createdAt: -1 });
 MessageSchema.index({ workspaceId: 1, messageId: 1 }, { unique: true });
 MessageSchema.index({ status: 1 });
+// Covers instances.service.ts's per-instance stats: countDocuments({instanceId,
+// direction}) and countDocuments({instanceId, createdAt:{$gte}}) — previously
+// unindexed collection scans, run for every instance on every GET /api/instances.
+MessageSchema.index({ instanceId: 1, direction: 1 });
+MessageSchema.index({ instanceId: 1, createdAt: -1 });
+// Global message search (see GET /api/messages/search) — same pattern as
+// Contact.model.ts's text index. Mongo allows only one text index per
+// collection, and this is the first/only one on Message.
+MessageSchema.index({ workspaceId: 1, 'content.text': 'text', 'content.caption': 'text' }, { name: 'msg_fulltext' });
 
 MessageSchema.set('toJSON', {
   virtuals: true,

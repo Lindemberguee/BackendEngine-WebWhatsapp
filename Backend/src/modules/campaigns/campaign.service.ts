@@ -1,13 +1,16 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { Types } from 'mongoose';
-import { Campaign, CampaignRecipient, Contact, Conversation, Message, Instance, Lead } from '../../db/models';
+import { Campaign, CampaignRecipient, Contact, Conversation, Message, Instance, Lead, WhatsAppTemplate } from '../../db/models';
 import type { ICampaign, ICampaignAudience, IFlowNode } from '../../db/models';
 import type { SessionManager } from '../../session-manager/SessionManager';
 import type { WebSocketGateway } from '../../ws/gateway';
 import { notify, notifyWorkspaceOwner } from '../notifications/notification.service';
 import { emitWebhookEvent } from '../webhooks/webhook.service';
-import { buildMessageContent, type FlowContext } from '../../flow-executor/senders';
+import { buildOutboundMessage, type FlowContext } from '../../flow-executor/senders';
+import { toBaileys } from '../../channels/baileys/to-baileys';
+import type { OutboundMessage } from '../../messaging/outbound-types';
 import { ensureDefaultPipeline, nextOrder, logLeadActivity } from '../crm/crm.service';
+import { findRateForSend } from './rate-lookup';
 import pino from 'pino';
 
 const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' });
@@ -23,6 +26,7 @@ export interface LeanContact {
   email?: string;
   status: string;
   optedOutAt?: Date;
+  whatsappOptInAt?: Date;
 }
 
 /** Opted-out / blocked contacts are excluded from every audience type, always. */
@@ -68,11 +72,43 @@ function toMessageDocType(blockType: string): string {
   return map[blockType] ?? 'text';
 }
 
-/** Appends an opt-out hint to whichever text-bearing field the built content has, in place. */
-function appendOptOutFooter(content: Record<string, unknown>): void {
+/** Appends an opt-out hint to whichever text-bearing field the message has, in
+ *  place. Never called for a 'template' kind — Meta rejects any deviation from
+ *  an approved template's exact approved body text. */
+function appendOptOutFooter(msg: OutboundMessage): void {
   const hint = '\n\n_Não quer mais receber essas mensagens? Responda PARAR._';
-  if (typeof content.text === 'string' && content.text.trim()) content.text += hint;
-  else if (typeof content.caption === 'string' && content.caption.trim()) content.caption += hint;
+  if (msg.kind === 'text' && msg.text.trim()) msg.text += hint;
+  else if ('caption' in msg) msg.caption = (msg.caption ? msg.caption + hint : hint.trim());
+}
+
+/** Builds the content stored on the Message doc + a plain-text preview for the
+ *  conversation list. Templates use the synced approved body with the actual
+ *  recipient variables substituted; other messages reuse their Baileys shape. */
+async function toStoredContent(
+  outbound: OutboundMessage,
+  blockType: string,
+  workspaceId: Types.ObjectId,
+  instanceId: Types.ObjectId
+): Promise<{ content: Record<string, unknown>; preview: string; docType: string }> {
+  if (outbound.kind === 'template') {
+    const template = await WhatsAppTemplate.findOne({
+      workspaceId, instanceId, name: outbound.templateName, language: outbound.language,
+    }).lean();
+    const rawComponents = Array.isArray(template?.components) ? template.components as Array<Record<string, unknown>> : [];
+    const body = rawComponents.find((component) => String(component.type).toUpperCase() === 'BODY');
+    let preview = typeof body?.text === 'string' ? body.text : `Template: ${outbound.templateName}`;
+    const sentComponents = Array.isArray(outbound.components) ? outbound.components as Array<Record<string, unknown>> : [];
+    const sentBody = sentComponents.find((component) => String(component.type).toLowerCase() === 'body');
+    const parameters = Array.isArray(sentBody?.parameters) ? sentBody.parameters as Array<Record<string, unknown>> : [];
+    parameters.forEach((parameter, index) => {
+      const value = typeof parameter.text === 'string' ? parameter.text : '';
+      preview = preview.replace(new RegExp(`\\{\\{\\s*${index + 1}\\s*\\}\\}`, 'g'), value);
+    });
+    return { content: { text: preview, template: { name: outbound.templateName, language: outbound.language, components: outbound.components } }, preview, docType: 'text' };
+  }
+  const content = (toBaileys(outbound) as Record<string, unknown> | null) ?? {};
+  const preview = typeof content.text === 'string' ? content.text : typeof content.caption === 'string' ? content.caption : '[mídia]';
+  return { content, preview, docType: toMessageDocType(blockType) };
 }
 
 /** Snapshot the resolved audience into CampaignRecipient rows and flip the campaign to scheduled/sending. */
@@ -83,8 +119,14 @@ export async function launchCampaign(campaignId: string, workspaceId: string): P
 
   // Only snapshot recipients the first time (draft → launch). Resuming from pause reuses existing rows.
   if (campaign.status === 'draft') {
-    const contacts = await resolveAudience(workspaceId, campaign.audience);
-    if (contacts.length === 0) throw new Error('Nenhum contato elegível para esse público');
+    let contacts = await resolveAudience(workspaceId, campaign.audience);
+    const usesOfficialChannel = await Instance.exists({ _id: { $in: campaign.instanceIds }, channel: 'cloud_api' });
+    if (usesOfficialChannel) contacts = contacts.filter((contact) => Boolean(contact.whatsappOptInAt));
+    if (contacts.length === 0) {
+      throw new Error(usesOfficialChannel
+        ? 'Nenhum contato elegível com consentimento de marketing registrado para a API Oficial'
+        : 'Nenhum contato elegível para esse público');
+    }
     await CampaignRecipient.insertMany(
       contacts.map((c) => ({
         workspaceId, campaignId: campaign._id, contactId: c._id, jid: c.jid, name: c.name, status: 'pending',
@@ -125,15 +167,20 @@ export async function sendTestMessage(sessionManager: SessionManager, campaign: 
   const jid = `${phone.replace(/\D/g, '')}@s.whatsapp.net`;
   const instance = await Instance.findOne({ _id: { $in: campaign.instanceIds }, status: 'connected' });
   if (!instance) throw new Error('Nenhuma instância conectada nessa campanha');
-  const session = sessionManager.getSession(instance._id.toString());
-  if (!session) throw new Error('Sessão não está pronta');
+  // ensureSession (not getSession) — a restart/reload drops the in-memory session
+  // map even though Instance.status in Mongo still reads 'connected', so a plain
+  // getSession() here always threw "Sessão não está pronta" for anyone testing
+  // right after a deploy, indistinguishable from an actually-broken connection.
+  // Same fix as every other send path (messages.routes.ts).
+  const session = await sessionManager.ensureSession(instance._id.toString());
+  if (!(await session.waitUntilReady(8000))) throw new Error('WhatsApp reconectando. Tente novamente em alguns segundos.');
 
   const ctx: FlowContext = { variables: {}, contact: { name: 'Você (teste)', phone } };
   const node = { id: 'campaign-test', blockType: campaign.message.blockType, config: campaign.message.config } as unknown as IFlowNode;
-  const content = buildMessageContent(node, ctx) as Record<string, unknown> | null;
-  if (!content) throw new Error('Mensagem inválida — confira o conteúdo configurado');
-  if (campaign.includeOptOutFooter) appendOptOutFooter(content);
-  await (session.sendMessage as (jid: string, c: unknown) => Promise<any>)(jid, content);
+  const outbound = await buildOutboundMessage(node, ctx, campaign.workspaceId.toString());
+  if (!outbound) throw new Error('Mensagem inválida — confira o conteúdo configurado');
+  if (campaign.includeOptOutFooter && outbound.kind !== 'template') appendOptOutFooter(outbound);
+  await session.sendMessage(jid, outbound);
 }
 
 /**
@@ -158,7 +205,16 @@ export async function sendNextRecipient(
     return 'paused';
   }
 
-  const recipient = await CampaignRecipient.findOne({ campaignId: campaign._id, status: 'pending' }).sort({ createdAt: 1 });
+  // Atomic claim: findOne+later-save left a window (Contact/Instance lookups,
+  // capacity counts, checkOnWhatsApp — several awaits) where the SAME recipient
+  // was still 'pending' and could be picked up again by an overlapping tick,
+  // double-sending the campaign message to that contact. Flipping to 'sending'
+  // right at the read makes the claim itself atomic.
+  const recipient = await CampaignRecipient.findOneAndUpdate(
+    { campaignId: campaign._id, status: 'pending' },
+    { $set: { status: 'sending' } },
+    { sort: { createdAt: 1 }, new: true }
+  );
   if (!recipient) return 'empty';
 
   const contact = await Contact.findById(recipient.contactId).lean();
@@ -171,8 +227,13 @@ export async function sendNextRecipient(
   }
 
   // Pick a connected instance with hourly AND daily capacity left, rotating through the campaign's list.
+  // Any 'no_capacity' return below must release the atomic claim above back to
+  // 'pending' — otherwise the recipient is stuck on 'sending' forever (it was
+  // only supposed to be a transient marker while we located a send slot).
+  const releaseClaim = () => CampaignRecipient.updateOne({ _id: recipient._id }, { $set: { status: 'pending' } });
+
   const instances = await Instance.find({ _id: { $in: campaign.instanceIds }, status: 'connected' }).lean();
-  if (!instances.length) return 'no_capacity';
+  if (!instances.length) { await releaseClaim(); return 'no_capacity'; }
   const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
   const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
   let chosen: (typeof instances)[number] | null = null;
@@ -186,10 +247,29 @@ export async function sendNextRecipient(
     ]);
     if (sentLastHour < campaign.throttle.maxPerInstancePerHour && sentToday < campaign.throttle.maxPerInstancePerDay) { chosen = candidate; break; }
   }
-  if (!chosen) return 'no_capacity';
+  if (!chosen) { await releaseClaim(); return 'no_capacity'; }
 
-  const session = sessionManager.getSession(chosen._id.toString());
-  if (!session) return 'no_capacity';
+  // ensureSession (not getSession) — an Instance can read status:'connected' in
+  // Mongo while its in-memory session was dropped by a restart/reload (see
+  // SessionManager.ensureSession's own comment). A plain getSession() here made
+  // a launched campaign stall at 0% forever, retried silently as 'no_capacity'
+  // every tick with nothing ever surfaced to the workspace owner.
+  const session = await sessionManager.ensureSession(chosen._id.toString());
+  if (!(await session.waitUntilReady(8000))) {
+    await releaseClaim();
+    // Only alert once per 15 minutes per campaign — the dispatcher retries every
+    // ~12s (3 ticks) while stalled, and without this dedup that's ~75 notifications/hour.
+    const alertedRecently = campaign.sessionAlertedAt && Date.now() - campaign.sessionAlertedAt.getTime() < 15 * 60_000;
+    if (!alertedRecently) {
+      await Campaign.updateOne({ _id: campaign._id }, { $set: { sessionAlertedAt: new Date() } });
+      void notifyWorkspaceOwner(gateway, campaign.workspaceId.toString(), {
+        type: 'campaign.completed', title: 'Campanha travada — sessão não pronta',
+        message: `"${campaign.name}" não consegue enviar: a conexão WhatsApp está reconectando. Verifique a instância em Instâncias.`,
+        link: `/campaigns/${campaign._id.toString()}`, metadata: { campaignId: campaign._id.toString() },
+      });
+    }
+    return 'no_capacity';
+  }
 
   // Validate the number is actually registered on WhatsApp before spending a send slot on it.
   if (session.checkOnWhatsApp) {
@@ -205,7 +285,7 @@ export async function sendNextRecipient(
     } catch { /* validation unavailable/failed — proceed and let the real send surface any error */ }
   }
 
-  recipient.status = 'sending';
+  // status is already 'sending' from the atomic claim above.
   recipient.instanceId = chosen._id as unknown as Types.ObjectId;
   await recipient.save();
   await Campaign.updateOne({ _id: campaign._id }, { $set: { lastInstanceIndex: nextIndex } });
@@ -213,15 +293,15 @@ export async function sendNextRecipient(
   try {
     const ctx: FlowContext = { variables: {}, contact: { name: contact.name, phone: contact.phone, email: contact.email } };
     const node = { id: 'campaign', blockType: campaign.message.blockType, config: campaign.message.config } as unknown as IFlowNode;
-    const content = buildMessageContent(node, ctx) as Record<string, unknown> | null;
-    if (!content) throw new Error('Mensagem inválida — confira o conteúdo configurado');
-    if (campaign.includeOptOutFooter) appendOptOutFooter(content);
+    const outbound = await buildOutboundMessage(node, ctx, campaign.workspaceId.toString());
+    if (!outbound) throw new Error('Mensagem inválida — confira o conteúdo configurado');
+    if (campaign.includeOptOutFooter && outbound.kind !== 'template') appendOptOutFooter(outbound);
 
-    const sent = await (session.sendMessage as (jid: string, c: unknown) => Promise<any>)(recipient.jid, content);
-    const messageId = sent?.key?.id ?? `campaign-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+    const sent = await session.sendMessage(recipient.jid, outbound);
+    const messageId = sent.providerMessageId ?? `campaign-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 
     // Find-or-create the conversation so this shows up like any normal outbound message.
-    let conversation = await Conversation.findOne({ workspaceId: campaign.workspaceId, jid: recipient.jid });
+    let conversation = await Conversation.findOne({ workspaceId: campaign.workspaceId, instanceId: chosen._id, jid: recipient.jid });
     if (!conversation) {
       conversation = await Conversation.create({
         workspaceId: campaign.workspaceId, name: contact.name, phone: contact.phone, jid: recipient.jid,
@@ -229,24 +309,64 @@ export async function sendNextRecipient(
       });
     }
     const now = new Date();
-    const preview = typeof content.text === 'string' ? content.text : typeof content.caption === 'string' ? content.caption : '[mídia]';
-    const docType = toMessageDocType(campaign.message.blockType);
-    await Message.create({
+    const { content, preview, docType } = await toStoredContent(outbound, campaign.message.blockType, campaign.workspaceId, chosen._id);
+    const savedMessage = await Message.create({
       workspaceId: campaign.workspaceId, instanceId: chosen._id, conversationId: conversation._id,
       jid: recipient.jid, messageId, direction: 'outbound', type: docType,
       status: 'sent', fromMe: true, content,
     });
     await Conversation.updateOne({ _id: conversation._id }, { $set: { lastMessage: { content: preview, type: docType, direction: 'outbound', timestamp: now } } });
 
+    gateway.broadcastToConversationVisibility(
+      campaign.workspaceId.toString(),
+      conversation.assignedAgentId?.toString(),
+      'message:new',
+      {
+        conversationId: conversation._id.toString(),
+        message: {
+          id: savedMessage._id.toString(),
+          conversationId: conversation._id.toString(),
+          type: savedMessage.type,
+          content: savedMessage.content,
+          direction: savedMessage.direction,
+          status: savedMessage.status,
+          timestamp: savedMessage.createdAt.toISOString(),
+        },
+      }
+    );
+
     // Tag the contact with the campaign so future audiences can include/exclude "already reached".
     await Contact.updateOne({ _id: contact._id }, { $addToSet: { tags: `campanha:${campaign.name}` } });
+
+    // Cost — only meaningful for a Cloud API template send; this is the
+    // platform's own rate-card estimate for THIS specific send (real category
+    // + real destination country), not Meta's actual bill (see rate-lookup.ts
+    // / pricing.service.ts for why no live quote exists). Recorded post-send
+    // so only sends that actually went out ever count toward the total.
+    let costCents: number | undefined;
+    let costCurrency: string | undefined;
+    if (campaign.message.blockType === 'message.template') {
+      const cfg = campaign.message.config as { templateName?: string; language?: string };
+      const template = cfg.templateName && cfg.language
+        ? await WhatsAppTemplate.findOne({ workspaceId: campaign.workspaceId, instanceId: chosen._id, name: cfg.templateName, language: cfg.language }).select('category').lean()
+        : null;
+      const rate = template ? await findRateForSend(contact.phone, template.category) : null;
+      if (rate) { costCents = rate.priceCents; costCurrency = rate.currency; }
+    }
 
     recipient.status = 'sent';
     recipient.messageId = messageId;
     recipient.conversationId = conversation._id as unknown as Types.ObjectId;
     recipient.sentAt = now;
+    if (costCents !== undefined) { recipient.estimatedCostCents = costCents; recipient.estimatedCostCurrency = costCurrency; }
     await recipient.save();
-    await Campaign.updateOne({ _id: campaign._id }, { $inc: { 'stats.sent': 1, 'stats.pending': -1 }, $set: { consecutiveFailures: 0 } });
+    await Campaign.updateOne(
+      { _id: campaign._id },
+      {
+        $inc: { 'stats.sent': 1, 'stats.pending': -1, ...(costCents ? { 'stats.estimatedCostCents': costCents } : {}) },
+        $set: { consecutiveFailures: 0, ...(costCurrency ? { estimatedCostCurrency: costCurrency } : {}) },
+      }
+    );
     return 'sent';
   } catch (err) {
     logger.warn({ err, recipientId: recipient._id }, '[campaign] send failed');

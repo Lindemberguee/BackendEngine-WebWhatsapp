@@ -1,4 +1,4 @@
-import { Subscription, Invoice, Workspace, Instance, User, Flow, Conversation } from '../../db/models';
+import { Subscription, Invoice, Workspace, Instance, User, Flow, Conversation, Pipeline } from '../../db/models';
 import type { ISubscription, BillingCycle } from '../../db/models';
 import { PLANS, getPlan, getPlanByTier, DEFAULT_TRIAL_TIER, TRIAL_DAYS, type PlanDefinition } from './plans.config';
 import { notify, notifyWorkspaceOwner } from '../notifications/notification.service';
@@ -212,12 +212,44 @@ export async function assertCampaignsEnabled(workspaceId: string): Promise<void>
   }
 }
 
+export async function assertOfficialChannelEnabled(workspaceId: string): Promise<void> {
+  const plan = await currentPlan(workspaceId);
+  if (!plan.limits.officialChannelEnabled) {
+    throw new PlanLimitError(`A API Oficial da Meta não está disponível no plano ${plan.name}. Faça upgrade pro plano Pro pra desbloquear.`);
+  }
+}
+
 export async function assertCanActivateAutomation(workspaceId: string): Promise<void> {
   const plan = await currentPlan(workspaceId);
   if (plan.limits.activeAutomations == null) return;
   const count = await Flow.countDocuments({ workspaceId, enabled: true });
   if (count >= plan.limits.activeAutomations) {
     throw new PlanLimitError(`Seu plano ${plan.name} permite até ${plan.limits.activeAutomations} automação(ões) ativa(s) ao mesmo tempo. Desative outra ou faça upgrade.`);
+  }
+}
+
+export async function assertCanCreatePipeline(workspaceId: string): Promise<void> {
+  const plan = await currentPlan(workspaceId);
+  if (plan.limits.crmMultiPipeline) return;
+  const count = await Pipeline.countDocuments({ workspaceId });
+  if (count >= 1) {
+    throw new PlanLimitError(`Seu plano ${plan.name} permite apenas 1 funil de CRM. Faça upgrade pro plano Pro pra criar múltiplos funis.`);
+  }
+}
+
+/** multiWorkspace is per-owner, not per-workspace: the first workspace a user
+ *  creates is always free, but a 2nd+ requires that at least one workspace
+ *  they already own is on a plan with multiWorkspace enabled (today, only
+ *  Enterprise). Checking this BEFORE the new workspace exists also closes the
+ *  loophole where creating workspace after workspace kept minting fresh
+ *  14-day Pro trials (getOrCreateSubscription never runs for a rejected create). */
+export async function assertCanCreateWorkspace(ownerId: string): Promise<void> {
+  const owned = await Workspace.find({ ownerId }).select('_id').lean();
+  if (owned.length === 0) return;
+  const subs = await Subscription.find({ workspaceId: { $in: owned.map((w) => w._id) } }).lean();
+  const anyMultiWorkspace = subs.some((s) => getPlan(s.planId)?.limits.multiWorkspace);
+  if (!anyMultiWorkspace) {
+    throw new PlanLimitError('Criar múltiplos workspaces exige o plano Enterprise em pelo menos um deles. Fale com vendas para habilitar.');
   }
 }
 
@@ -250,6 +282,29 @@ export async function expireDueTrials(wsGateway: WebSocketGateway): Promise<void
     } catch (err) {
       logger.warn({ err, workspaceId: sub.workspaceId }, '[billing] failed to expire trial');
     }
+  }
+}
+
+/** Applies a requested cancellation when the paid period ends. Data remains intact;
+ * the workspace returns to the baseline Starter tier and can be upgraded again. */
+export async function expireDueCancellations(wsGateway: WebSocketGateway): Promise<void> {
+  const now = new Date();
+  const due = await Subscription.find({ status: 'active', cancelAtPeriodEnd: true, currentPeriodEnd: { $lte: now } });
+  const starter = getPlanByTier('starter')!;
+  for (const sub of due) {
+    sub.planId = starter.id;
+    sub.status = 'canceled';
+    sub.cancelAtPeriodEnd = false;
+    sub.currentPeriodStart = now;
+    sub.currentPeriodEnd = addDays(now, 30);
+    sub.provider = 'manual';
+    sub.externalSubscriptionId = undefined;
+    await sub.save();
+    await Workspace.updateOne({ _id: sub.workspaceId }, { $set: { plan: starter.tier } });
+    void notifyWorkspaceOwner(wsGateway, sub.workspaceId.toString(), {
+      type: 'billing.plan_changed', title: 'Assinatura encerrada',
+      message: 'O período contratado terminou e o workspace voltou para o plano Starter.', link: '/billing',
+    });
   }
 }
 

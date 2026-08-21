@@ -44,7 +44,6 @@ const SubscriptionSchema = new Schema<ISubscription>(
   { timestamps: true }
 );
 
-SubscriptionSchema.index({ workspaceId: 1 }, { unique: true });
 SubscriptionSchema.index({ status: 1, trialEndsAt: 1 });
 
 SubscriptionSchema.set('toJSON', {

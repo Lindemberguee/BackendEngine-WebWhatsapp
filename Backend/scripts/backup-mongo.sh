@@ -7,6 +7,7 @@
 # the host, or run this inside a container that has it) and MONGODB_URI set in the
 # environment (same variable the backend itself uses).
 set -euo pipefail
+umask 077
 
 MONGODB_URI="${MONGODB_URI:?set MONGODB_URI before running this script}"
 BACKUP_DIR="${BACKUP_DIR:-/opt/backups/mongo}"
@@ -18,14 +19,19 @@ timestamp="$(date +%Y%m%d-%H%M%S)"
 dump_dir="$BACKUP_DIR/dump-$timestamp"
 archive="$BACKUP_DIR/webwhatsapp-$timestamp.tar.gz"
 
-echo "[backup-mongo] Dumping $MONGODB_URI -> $dump_dir"
+echo "[backup-mongo] Dumping MongoDB -> $dump_dir"
 mongodump --uri="$MONGODB_URI" --out="$dump_dir"
 
 echo "[backup-mongo] Compressing -> $archive"
 tar -czf "$archive" -C "$dump_dir" .
 rm -rf "$dump_dir"
 
+echo "[backup-mongo] Verifying archive"
+tar -tzf "$archive" >/dev/null
+sha256sum "$archive" > "$archive.sha256"
+
 echo "[backup-mongo] Pruning backups older than $RETENTION_DAYS days"
 find "$BACKUP_DIR" -name 'webwhatsapp-*.tar.gz' -mtime "+$RETENTION_DAYS" -delete
+find "$BACKUP_DIR" -name 'webwhatsapp-*.tar.gz.sha256' -mtime "+$RETENTION_DAYS" -delete
 
 echo "[backup-mongo] Done: $archive"

@@ -65,6 +65,12 @@ const UserSchema = new Schema<IUser>(
 );
 
 UserSchema.index({ email: 1, workspaceId: 1 }, { unique: true });
+// Covers routing.service.ts's pickAgent query — User.find({workspaceId, role,
+// availability, isActive}) — which the routing scheduler runs per queued
+// conversation, every tick, for every workspace with pending conversations.
+// Without a workspaceId-prefixed index, that's a full collection scan across
+// every tenant's users on every routing pass.
+UserSchema.index({ workspaceId: 1, role: 1, availability: 1 });
 
 UserSchema.methods.comparePassword = function (plain: string): Promise<boolean> {
   return bcrypt.compare(plain, this.passwordHash);

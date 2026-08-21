@@ -12,7 +12,14 @@ export async function registerWorkspace(data: {
 }): Promise<{ user: IUser; workspaceId: string }> {
   if (!data.acceptedTerms) throw new Error('É necessário aceitar os Termos de Uso e a Política de Privacidade');
 
-  const existing = await User.findOne({ email: data.email });
+  // Must match the exact normalization the schema applies on save (lowercase + trim) —
+  // comparing the raw client string here let "Victim@Corp.com" sail past this check
+  // against an already-normalized "victim@corp.com" in the DB, creating a second
+  // account under the same real email in a brand-new workspace. From there
+  // GET /api/workspaces and POST /api/workspaces/switch (which match by email) treated
+  // it as the same person and handed out a valid owner session for the real account.
+  const normalizedEmail = data.email.trim().toLowerCase();
+  const existing = await User.findOne({ email: normalizedEmail });
   if (existing) throw new Error('E-mail já cadastrado');
 
   const slug = data.workspaceName
@@ -35,7 +42,7 @@ export async function registerWorkspace(data: {
   const user = await User.create({
     workspaceId: workspace._id,
     name: data.ownerName,
-    email: data.email,
+    email: normalizedEmail,
     passwordHash: data.password,
     role: 'owner',
     isActive: true,
@@ -52,11 +59,14 @@ export async function registerWorkspace(data: {
 }
 
 export async function loginUser(email: string, password: string): Promise<IUser> {
-  const user = await User.findOne({ email: email.toLowerCase(), isActive: true });
+  const user = await User.findOne({ email: email.trim().toLowerCase(), isActive: true });
   if (!user) throw new Error('Credenciais inválidas');
 
   const valid = await user.comparePassword(password);
   if (!valid) throw new Error('Credenciais inválidas');
+
+  const workspace = await Workspace.findById(user.workspaceId).select('status').lean();
+  if (!workspace || workspace.status === 'suspended') throw new Error('Workspace suspenso — fale com o suporte');
 
   await User.updateOne({ _id: user._id }, { lastLoginAt: new Date() });
 

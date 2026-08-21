@@ -1,5 +1,6 @@
 # Dependencies
 node_modules/
+Backend/data/media/
 
 # Build output
 dist/

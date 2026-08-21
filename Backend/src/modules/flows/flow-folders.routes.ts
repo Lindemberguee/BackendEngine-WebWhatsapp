@@ -1,9 +1,13 @@
 import type { FastifyInstance } from 'fastify';
 import { Types } from 'mongoose';
 import { FlowFolder, Flow } from '../../db/models';
+import { requireRole } from '../../utils/require-role';
 
 export async function flowFoldersRoutes(fastify: FastifyInstance): Promise<void> {
   const auth = { preHandler: [fastify.authenticate] };
+  // Same split as flows.routes.ts — folders are just organization for flows, but
+  // mutating them (renaming, deleting — which unlinks flows) is still owner/admin.
+  const canWrite = { preHandler: [fastify.authenticate, requireRole(['owner', 'admin'])] };
   const valid = (id: string) => Types.ObjectId.isValid(id);
 
   // GET /api/flow-folders
@@ -14,7 +18,7 @@ export async function flowFoldersRoutes(fastify: FastifyInstance): Promise<void>
   });
 
   // POST /api/flow-folders
-  fastify.post('/', auth, async (request, reply) => {
+  fastify.post('/', canWrite, async (request, reply) => {
     const { workspaceId } = request.user as { workspaceId: string };
     const { name, color, description } = request.body as { name?: string; color?: string; description?: string };
     if (!name?.trim()) return reply.status(400).send({ error: 'Nome é obrigatório' });
@@ -32,7 +36,7 @@ export async function flowFoldersRoutes(fastify: FastifyInstance): Promise<void>
   });
 
   // PATCH /api/flow-folders/:id
-  fastify.patch('/:id', auth, async (request, reply) => {
+  fastify.patch('/:id', canWrite, async (request, reply) => {
     const { workspaceId } = request.user as { workspaceId: string };
     const { id } = request.params as { id: string };
     if (!valid(id)) return reply.status(404).send({ error: 'Pasta não encontrada' });
@@ -52,7 +56,7 @@ export async function flowFoldersRoutes(fastify: FastifyInstance): Promise<void>
   });
 
   // DELETE /api/flow-folders/:id
-  fastify.delete('/:id', auth, async (request, reply) => {
+  fastify.delete('/:id', canWrite, async (request, reply) => {
     const { workspaceId } = request.user as { workspaceId: string };
     const { id } = request.params as { id: string };
     if (!valid(id)) return reply.status(404).send({ error: 'Pasta não encontrada' });

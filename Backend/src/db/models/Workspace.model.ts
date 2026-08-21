@@ -8,6 +8,9 @@ export interface IWorkspace extends Document {
   ownerId: Types.ObjectId;
   logoUrl?: string;
   settings: Record<string, unknown>;
+  /** Platform-level suspension. Suspended workspaces cannot authenticate or use API keys. */
+  status: 'active' | 'suspended';
+  suspendedAt?: Date;
   /** Set when the owner requests account deletion (LGPD right to erasure) — cleared on cancel. */
   deletionRequestedAt?: Date;
   /** Cascade-delete runs once this passes (see workspace-deletion-scheduler.ts) — a 30-day grace window from the request. */
@@ -24,6 +27,8 @@ const WorkspaceSchema = new Schema<IWorkspace>(
     ownerId:  { type: Schema.Types.ObjectId, ref: 'User', required: true },
     logoUrl:  { type: String },
     settings: { type: Schema.Types.Mixed, default: {} },
+    status:   { type: String, enum: ['active', 'suspended'], default: 'active' },
+    suspendedAt: { type: Date },
     deletionRequestedAt: { type: Date },
     deletionScheduledFor: { type: Date },
   },
@@ -31,5 +36,6 @@ const WorkspaceSchema = new Schema<IWorkspace>(
 );
 
 WorkspaceSchema.index({ deletionScheduledFor: 1 });
+WorkspaceSchema.index({ status: 1, createdAt: -1 });
 
 export const Workspace = model<IWorkspace>('Workspace', WorkspaceSchema);

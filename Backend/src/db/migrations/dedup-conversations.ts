@@ -1,5 +1,4 @@
 import { Conversation, Message } from '../models';
-import type { Types } from 'mongoose';
 
 /**
  * Deduplicate conversations with the same phone but different JID formats

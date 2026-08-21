@@ -4,6 +4,8 @@ import { randomBytes } from 'crypto';
 import { WebhookSubscription, WebhookDelivery, WebhookInboundLog, WEBHOOK_EVENTS } from '../../db/models';
 import type { WebhookEvent } from '../../db/models';
 import { requireRole } from '../../utils/require-role';
+import { isPublicHttpUrl } from '../../shared/url-security';
+import { parsePagination } from '../../utils/pagination';
 
 function validEvents(events: unknown): WebhookEvent[] {
   return Array.isArray(events) ? events.filter((e): e is WebhookEvent => WEBHOOK_EVENTS.includes(e)) : [];
@@ -29,6 +31,7 @@ export async function webhooksRoutes(fastify: FastifyInstance): Promise<void> {
     const { workspaceId } = request.user as { workspaceId: string };
     const { url, events } = request.body as { url?: string; events?: string[] };
     if (!url?.trim()) return reply.status(400).send({ error: 'URL é obrigatória' });
+    if (!isPublicHttpUrl(url.trim())) return reply.status(400).send({ error: 'URL inválida ou aponta para um host interno' });
     const validatedEvents = validEvents(events);
     if (!validatedEvents.length) return reply.status(400).send({ error: 'Selecione ao menos um evento' });
 
@@ -47,7 +50,10 @@ export async function webhooksRoutes(fastify: FastifyInstance): Promise<void> {
     const { url, events, enabled } = request.body as { url?: string; events?: string[]; enabled?: boolean };
 
     const update: Record<string, unknown> = {};
-    if (url !== undefined) update.url = url.trim();
+    if (url !== undefined) {
+      if (!isPublicHttpUrl(url.trim())) return reply.status(400).send({ error: 'URL inválida ou aponta para um host interno' });
+      update.url = url.trim();
+    }
     if (events !== undefined) update.events = validEvents(events);
     if (enabled !== undefined) update.enabled = enabled;
 
@@ -84,39 +90,38 @@ export async function webhooksRoutes(fastify: FastifyInstance): Promise<void> {
   fastify.get('/:id/deliveries', auth, async (request, reply) => {
     const { workspaceId } = request.user as { workspaceId: string };
     const { id } = request.params as { id: string };
-    const { page = '1', limit = '20' } = request.query as Record<string, string>;
+    const { page, limit, skip } = parsePagination(request.query as Record<string, string>);
     if (!valid(id)) return reply.status(404).send({ error: 'Webhook não encontrado' });
 
     const sub = await WebhookSubscription.findOne({ _id: id, workspaceId }).select('_id').lean();
     if (!sub) return reply.status(404).send({ error: 'Webhook não encontrado' });
 
-    const skip = (Number(page) - 1) * Number(limit);
     const [deliveries, total] = await Promise.all([
-      WebhookDelivery.find({ subscriptionId: id }).sort({ createdAt: -1 }).skip(skip).limit(Number(limit)),
+      WebhookDelivery.find({ subscriptionId: id }).sort({ createdAt: -1 }).skip(skip).limit(limit),
       WebhookDelivery.countDocuments({ subscriptionId: id }),
     ]);
     return reply.send({
       data: deliveries.map((d) => d.toJSON()),
-      pagination: { page: Number(page), limit: Number(limit), total, totalPages: Math.ceil(total / Number(limit)) },
+      pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
     });
   });
 
   // GET /api/webhooks/inbound-logs — log of every flow webhook-trigger hit (POST /api/webhooks/in/:token)
   fastify.get('/inbound-logs', auth, async (request, reply) => {
     const { workspaceId } = request.user as { workspaceId: string };
-    const { flowId, page = '1', limit = '20' } = request.query as Record<string, string>;
+    const { flowId } = request.query as Record<string, string>;
+    const { page, limit, skip } = parsePagination(request.query as Record<string, string>);
 
     const filter: Record<string, unknown> = { workspaceId };
     if (flowId && Types.ObjectId.isValid(flowId)) filter.flowId = flowId;
 
-    const skip = (Number(page) - 1) * Number(limit);
     const [logs, total] = await Promise.all([
-      WebhookInboundLog.find(filter).sort({ createdAt: -1 }).skip(skip).limit(Number(limit)),
+      WebhookInboundLog.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit),
       WebhookInboundLog.countDocuments(filter),
     ]);
     return reply.send({
       data: logs.map((l) => l.toJSON()),
-      pagination: { page: Number(page), limit: Number(limit), total, totalPages: Math.ceil(total / Number(limit)) },
+      pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
     });
   });
 

@@ -6,6 +6,7 @@ import {
   WebhookSubscription, WebhookDelivery, WebhookInboundLog, ApiKey, Avatar, AuditLog, Notification,
 } from '../../db/models';
 import type { SessionManager } from '../../session-manager/SessionManager';
+import { deleteMedia } from '../../shared/media-storage';
 
 const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' });
 
@@ -33,6 +34,14 @@ const WORKSPACE_SCOPED_MODELS: Array<{ deleteMany(filter: Record<string, unknown
  * and finally the Workspace document.
  */
 export async function deleteWorkspaceCascade(sessionManager: SessionManager, workspaceId: string): Promise<void> {
+  const archivedMedia = Message.find({ workspaceId, 'mediaStorage.key': { $exists: true } }).select('mediaStorage').lean().cursor();
+  for await (const message of archivedMedia) {
+    if (message.mediaStorage?.key) {
+      await deleteMedia(message.mediaStorage.key, message.mediaStorage.provider).catch((err) =>
+        logger.warn({ err, key: message.mediaStorage?.key }, '[workspace-deletion] failed to delete archived media')
+      );
+    }
+  }
   const instances = await Instance.find({ workspaceId }).select('_id').lean();
   for (const inst of instances) {
     try {

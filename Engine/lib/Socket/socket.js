@@ -431,6 +431,12 @@ const makeSocket = (config) => {
     }
 
     const onMessageReceived = (data) => {
+        // decodeFrame is async and its `onFrame` callback can itself throw/reject
+        // (e.g. a GCM auth failure on counter desync, or any handler run inline
+        // during frame processing). This is called from a sync 'message' listener
+        // with no caller to await/catch it, so an unguarded rejection here becomes
+        // an unhandled rejection — this is the highest-traffic path in the whole
+        // socket layer (every inbound byte flows through it).
         noise.decodeFrame(data, frame => {
             // reset ping timeout
             lastDateRecv = new Date()
@@ -466,7 +472,7 @@ const makeSocket = (config) => {
                     logger.debug({ unhandled: true, msgId, fromMe: false, frame }, 'communication recv')
                 }
             }
-        })
+        }).catch(err => onUnexpectedError(err, 'processing incoming frame'))
     }
 
     const end = (error) => {
@@ -495,28 +501,45 @@ const makeSocket = (config) => {
         ws.removeAllListeners()
 
         // CONNECTION STABILITY: Flush pending buffered events before closing.
+        // Wrapped — this runs registered consumer listeners synchronously, and a
+        // throwing consumer here must not abort teardown before noise.destroy()/
+        // ev.removeAllListeners() below run.
         if (ev.isBuffering()) {
-            ev.flush()
+            try { ev.flush() } catch (err) { onUnexpectedError(err, 'flushing events during connection end') }
         }
 
         /**
          * CONNECTION STABILITY: Race ws.close() against a 5s timeout to prevent
          * hanging indefinitely if the underlying TCP socket is stuck.
+         *
+         * Always call this, even if isClosed/isClosing — ws.close() is what
+         * detaches the native forwarding listeners (WebSocketClient.close()'s
+         * `socketListeners` cleanup); skipping it when the socket died on its
+         * own (e.g. the user logs out from their phone) left those forwarders
+         * attached to the native socket while removeAllListeners() above had
+         * already stripped every listener from this wrapper — a later stray
+         * native 'error' event then had nothing to catch it, which crashes
+         * the process (EventEmitter's special-cased behavior for 'error').
+         * WebSocketClient.close() is itself a safe no-op if already closed.
          */
-        if (!ws.isClosed && !ws.isClosing) {
-            Promise.race([
-                (async () => { try { await ws.close() } catch { } })(),
-                new Promise(resolve => setTimeout(resolve, 5000))
-            ])
-        }
+        Promise.race([
+            (async () => { try { await ws.close() } catch { } })(),
+            new Promise(resolve => setTimeout(resolve, 5000))
+        ])
 
-        ev.emit('connection.update', {
-            connection: 'close',
-            lastDisconnect: {
-                error,
-                date: new Date()
-            }
-        })
+        // Same reasoning as the flush above — a throwing 'connection.update'
+        // consumer must not prevent noise.destroy()/ev.removeAllListeners().
+        try {
+            ev.emit('connection.update', {
+                connection: 'close',
+                lastDisconnect: {
+                    error,
+                    date: new Date()
+                }
+            })
+        } catch (err) {
+            onUnexpectedError(err, 'emitting connection.update during connection end')
+        }
 
         // CONNECTION STABILITY: Release noise handler encryption buffers and state.
         noise.destroy()
@@ -788,6 +811,7 @@ const makeSocket = (config) => {
 
     // QR gen
     ws.on('CB:iq,type:set,pair-device', async (stanza) => {
+      try {
         const iq = {
             tag: 'iq',
             attrs: {
@@ -828,6 +852,9 @@ const makeSocket = (config) => {
         }
 
         genPairQR()
+      } catch (err) {
+        onUnexpectedError(err, 'handling pair-device')
+      }
     })
 
     // device paired for the first time
@@ -908,7 +935,7 @@ const makeSocket = (config) => {
             tag: 'ib',
             attrs: {},
             content: [{ tag: 'offline_batch', attrs: { count: '100' } }]
-        })
+        }).catch(err => onUnexpectedError(err, 'requesting offline batch'))
     })
 
     ws.on('CB:ib,,edge_routing', (node) => {

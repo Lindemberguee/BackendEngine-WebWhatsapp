@@ -15,7 +15,23 @@ export { FlowRunner } from './runner';
  */
 export async function cancelFlowRuns(conversationId: string): Promise<number> {
   const res = await FlowRun.updateMany(
-    { conversationId, status: { $in: ['running', 'waiting'] } },
+    { conversationId, status: { $in: ['running', 'waiting', 'delayed'] } },
+    { $set: { status: 'cancelled' } }
+  );
+  return res.modifiedCount ?? 0;
+}
+
+/**
+ * End every non-terminal run of a specific flow. Called when a flow is deleted or
+ * disabled — previously neither touched in-progress FlowRuns, so a run mid-delay
+ * or waiting on a reply for a flow that no longer exists (or was just turned off
+ * because it was misbehaving) kept going: DELETE made every subsequent step throw
+ * "flow not found" into the run's try/catch (now marks it failed instead of
+ * looping forever, but still — better to end it outright here).
+ */
+export async function cancelFlowRunsForFlow(flowId: string): Promise<number> {
+  const res = await FlowRun.updateMany(
+    { flowId, status: { $in: ['running', 'waiting', 'delayed'] } },
     { $set: { status: 'cancelled' } }
   );
   return res.modifiedCount ?? 0;
@@ -38,11 +54,15 @@ export function extractReplyId(msg: WAMessage): string | undefined {
 interface InboundParams {
   workspaceId: string;
   instanceId: string;
-  conversation: { _id: unknown; contactId?: unknown; name?: string; phone?: string; jid: string };
+  conversation: { _id: unknown; contactId?: unknown; name?: string; phone?: string; jid: string; allowBotInGroups?: boolean };
   contact: FlowContext['contact'];
   text: string;
   msg: WAMessage;
   isGroup?: boolean;
+  /** True when this inbound message's Contact doc was just created (first-ever
+   *  contact from this phone number in the workspace) — feeds the 'new_contact'
+   *  trigger type. */
+  isNewContact?: boolean;
   sendMessage: RunnerDeps['sendMessage'];
   sendPresence?: RunnerDeps['sendPresence'];
   wsGateway?: WebSocketGateway;
@@ -53,12 +73,21 @@ interface InboundParams {
  * starts a flow whose keyword trigger matches. Never throws into the caller.
  */
 export async function handleInboundForFlows(params: InboundParams): Promise<void> {
-  const { workspaceId, instanceId, conversation, contact, text, msg, isGroup = false, sendMessage, sendPresence, wsGateway } = params;
+  const { workspaceId, instanceId, conversation, contact, text, msg, isGroup = false, isNewContact = false, sendMessage, sendPresence, wsGateway } = params;
   const runner = new FlowRunner({ sendMessage, sendPresence, wsGateway });
   const convId = String(conversation._id);
   const inboundKey = msg.key?.id
     ? { id: msg.key.id, remoteJid: conversation.jid, fromMe: false }
     : undefined;
+
+  // The bot must never talk over a human — previously this check only guarded the
+  // any_message catch-all (below), so a waiting flow's resume() and a keyword
+  // trigger could both still fire and respond right on top of an agent already
+  // handling the conversation (assigned, or attendanceMode explicitly set to
+  // 'human'). Fetched once up front and reused for both gates below.
+  const convState = await Conversation.findById(convId).select('assignedAgentId attendanceMode').lean();
+  const humanEngaged = Boolean(convState?.assignedAgentId) || convState?.attendanceMode === 'human';
+  if (humanEngaged) return;
 
   // 1) Try to resume a run waiting on this conversation.
   const waitingRun = await FlowRun.findOne({ conversationId: convId, status: 'waiting' }).sort({ updatedAt: -1 });
@@ -99,7 +128,8 @@ export async function handleInboundForFlows(params: InboundParams): Promise<void
   //    Groups: by default flows are disabled for groups. A flow can opt-in via
   //    trigger.allowGroups = true; if no enabled flow allows groups, skip entirely.
   if (isGroup) {
-    const hasGroupFlow = await Flow.exists({ workspaceId, enabled: true, 'trigger.allowGroups': true });
+    const hasGroupFlow = conversation.allowBotInGroups
+      || await Flow.exists({ workspaceId, enabled: true, 'trigger.allowGroups': true });
     if (!hasGroupFlow) return;
   }
   const lower = text.trim().toLowerCase();
@@ -109,10 +139,13 @@ export async function handleInboundForFlows(params: InboundParams): Promise<void
   const instanceOr = Types.ObjectId.isValid(instanceId)
     ? [...anyInstance, { instanceId: new Types.ObjectId(instanceId) }]
     : anyInstance;
-  const groupFilter = isGroup ? { 'trigger.allowGroups': true } : {};
+  // Once a group has explicitly opted in (allowBotInGroups), any matching flow may run
+  // there regardless of its own trigger.allowGroups — the per-group toggle is the
+  // override; otherwise a group still needs a flow that opted in workspace-wide.
+  const groupFilter = isGroup && !conversation.allowBotInGroups ? { 'trigger.allowGroups': true } : {};
   const flows = await Flow.find({
     workspaceId, enabled: true,
-    'trigger.type': { $in: ['keyword', 'any_message'] },
+    'trigger.type': { $in: ['keyword', 'any_message', 'new_contact'] },
     $or: instanceOr,
     ...groupFilter,
   }).lean();
@@ -121,19 +154,23 @@ export async function handleInboundForFlows(params: InboundParams): Promise<void
         && (f.trigger?.keywords ?? []).some((k) => k && lower.includes(k.toLowerCase())))
     : undefined;
 
-  // Catch-all fallback — only when there's no waiting flow to preserve AND no
-  // human agent is assigned (the bot must never talk over an agent handling the
-  // conversation). Resolving an attendance clears the assignment, so a finished
-  // conversation becomes eligible again.
-  let catchAll = (!keywordMatch && !waitingRun)
+  // 'new_contact' sits between keyword (most specific) and the any_message
+  // catch-all (least specific) — a keyword coincidentally matching someone's
+  // very first message still wins, but a first-time contact with no keyword
+  // match gets the dedicated welcome flow instead of falling all the way to
+  // the generic catch-all.
+  const newContactMatch = (!keywordMatch && isNewContact && !waitingRun)
+    ? flows.find((f) => f.trigger?.type === 'new_contact')
+    : undefined;
+
+  // Catch-all fallback — only when there's no waiting flow to preserve. (The
+  // human-engaged check that used to live here is now the single early-return
+  // gate above, covering keyword triggers and resume too, not just this catch-all.)
+  const catchAll = (!keywordMatch && !newContactMatch && !waitingRun)
     ? flows.find((f) => f.trigger?.type === 'any_message')
     : undefined;
-  if (catchAll) {
-    const conv = await Conversation.findById(convId).select('assignedAgentId').lean();
-    if (conv?.assignedAgentId) catchAll = undefined;
-  }
 
-  const match = keywordMatch ?? catchAll;
+  const match = keywordMatch ?? newContactMatch ?? catchAll;
   if (!match) return;
 
   // A fresh trigger matched — cancel a lingering waiting run so it can't resurface.

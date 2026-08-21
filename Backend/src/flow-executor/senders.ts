@@ -1,5 +1,21 @@
+import { Types } from 'mongoose';
 import type { AnyMessageContent } from '@webwhatsapp/engine';
-import type { IFlowNode } from '../db/models';
+import { QuickReply, type IFlowNode } from '../db/models';
+import { toBaileys } from '../channels/baileys/to-baileys';
+import type { OutboundMessage, OutboundButton } from '../messaging/outbound-types';
+import { isPublicHttpUrl } from '../shared/url-security';
+
+// A flow author (or, via campaign audience / variable interpolation, a value an
+// attacker influenced) can put anything in a media/link URL field. The engine
+// falls back to reading non-http(s) values as a local file path, and any http(s)
+// value reaches the target host directly from this server — so every URL a flow
+// block sends onward must be a public http(s) URL, same gate as the manual send
+// route (messages.routes.ts) and the automation.webhook block (runner.ts). Blocks
+// with an invalid URL are treated the same as a block with no URL: skipped (see
+// the empty-string checks elsewhere in this file).
+function safeUrl(url: string): string {
+  return url.trim() && isPublicHttpUrl(url) ? url : '';
+}
 
 // ─── Variable interpolation ─────────────────────────────────────────────────
 
@@ -8,18 +24,26 @@ export interface FlowContext {
   contact: { name?: string; phone?: string; email?: string; company?: string };
   /** WhatsApp key of the last inbound message (for reactions / quoting). */
   lastInboundKey?: { id: string; remoteJid: string; fromMe: boolean };
+  /** WhatsApp key of the message that started this flow run (message.reaction "trigger" target). */
+  triggerKey?: { id: string; remoteJid: string; fromMe: boolean };
 }
+
+// Fixed timezone (not the host machine's) so {{data}}/{{hora}} are deterministic
+// regardless of where the server runs — matches condition.time/condition.weekday,
+// which already pass an explicit IANA zone instead of relying on the OS default.
+const BUILTIN_TZ = 'America/Sao_Paulo';
 
 /** Replace {{tokens}} with contact fields or saved variables. */
 export function interpolate(text: string, ctx: FlowContext): string {
   if (!text) return text;
+  const now = new Date();
   const map: Record<string, string> = {
     nome: ctx.contact.name ?? '',
     telefone: ctx.contact.phone ?? '',
     email: ctx.contact.email ?? '',
     empresa: ctx.contact.company ?? '',
-    data: new Date().toLocaleDateString('pt-BR'),
-    hora: new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }),
+    data: now.toLocaleDateString('pt-BR', { timeZone: BUILTIN_TZ }),
+    hora: now.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', timeZone: BUILTIN_TZ }),
   };
   return text.replace(/\{\{\s*(\w+)\s*\}\}/g, (_, key: string) => {
     if (key in map) return map[key];
@@ -41,96 +65,107 @@ function guessMime(fileName: string): string {
   return (ext && map[ext]) || 'application/octet-stream';
 }
 
-// Native-flow (interactive) button → Baileys NativeFlowButton
-function nativeButton(type: string, label: string, value: string) {
-  switch (type) {
-    case 'url':  return { name: 'cta_url',  buttonParamsJson: JSON.stringify({ display_text: label, url: value }) };
-    case 'call': return { name: 'cta_call', buttonParamsJson: JSON.stringify({ display_text: label, phone_number: value }) };
-    case 'copy': return { name: 'cta_copy', buttonParamsJson: JSON.stringify({ display_text: label, copy_code: value }) };
-    default:     return { name: 'quick_reply', buttonParamsJson: JSON.stringify({ display_text: label, id: value }) };
-  }
-}
-
 /**
- * Translate a flow block into Baileys message content. Returns null for blocks
- * that don't send a message (conditions, actions, delays — handled by the runner).
- * This is the single place that maps our blocks onto ALL of Baileys' message
- * resources (interactive buttons, lists, carousel, media flags, reactions…).
+ * Translate a flow block into the channel-neutral message IR (see
+ * messaging/outbound-types.ts). Returns null for blocks that don't send a
+ * message (conditions, actions, delays — handled by the runner). This is the
+ * single place that maps our blocks onto every message resource (interactive
+ * buttons, lists, carousel, media flags, reactions…) — channel-specific wire
+ * formats live in the per-channel translators under channels/ (to-baileys.ts, to-cloud-api.ts).
+ *
+ * Async (and takes `workspaceId`) because `message.quick_reply` needs a DB read
+ * to resolve the saved canned message before it can build content — every other
+ * case is pure/sync and just awaits through.
  */
-export function buildMessageContent(node: IFlowNode, ctx: FlowContext): AnyMessageContent | null {
+export async function buildOutboundMessage(node: IFlowNode, ctx: FlowContext, workspaceId: string): Promise<OutboundMessage | null> {
   const c = node.config;
   const t = (v: unknown) => interpolate(s(v), ctx);
+  const button = (btn: { type?: string; id?: string; label: string; value?: string }): OutboundButton => ({
+    type: (btn.type as OutboundButton['type']) ?? 'reply',
+    label: interpolate(btn.label, ctx),
+    value: btn.type && btn.type !== 'reply' ? String(btn.value ?? '') : String(btn.id ?? ''),
+  });
 
   switch (node.blockType) {
+    case 'message.quick_reply': {
+      const id = String(c.quickReplyId ?? '');
+      if (!Types.ObjectId.isValid(id)) return null;
+      const doc = await QuickReply.findOne({ _id: id, workspaceId }).select('content').lean();
+      if (!doc?.content?.trim()) return null;
+      return { kind: 'text', text: interpolate(doc.content, ctx) };
+    }
+
     case 'message.text':
       // Guard: never send an empty text.
-      return t(c.content).trim() ? { text: t(c.content) } : null;
+      return t(c.content).trim() ? { kind: 'text', text: t(c.content) } : null;
 
-    case 'message.image':
-      return s(c.url).trim() ? { image: { url: s(c.url) }, caption: t(c.caption) || undefined, viewOnce: b(c.viewOnce) } as AnyMessageContent : null;
+    case 'message.image': {
+      const url = safeUrl(s(c.url));
+      return url ? { kind: 'image', url, caption: t(c.caption) || undefined, viewOnce: b(c.viewOnce) } : null;
+    }
 
-    case 'message.video':
-      return s(c.url).trim() ? { video: { url: s(c.url) }, caption: t(c.caption) || undefined, gifPlayback: b(c.gifPlayback), viewOnce: b(c.viewOnce) } as AnyMessageContent : null;
+    case 'message.video': {
+      const url = safeUrl(s(c.url));
+      return url ? { kind: 'video', url, caption: t(c.caption) || undefined, gifPlayback: b(c.gifPlayback), viewOnce: b(c.viewOnce) } : null;
+    }
 
-    case 'message.audio':
-      return s(c.url).trim() ? { audio: { url: s(c.url) }, ptt: b(c.ptt), mimetype: 'audio/mp4' } as AnyMessageContent : null;
+    case 'message.audio': {
+      const url = safeUrl(s(c.url));
+      return url ? { kind: 'audio', url, ptt: b(c.ptt) } : null;
+    }
 
     case 'message.document': {
-      if (!s(c.url).trim()) return null;
+      const url = safeUrl(s(c.url));
+      if (!url) return null;
       const fileName = s(c.filename) || 'arquivo';
-      return { document: { url: s(c.url) }, fileName, mimetype: guessMime(fileName), caption: t(c.caption) || undefined } as AnyMessageContent;
+      return { kind: 'document', url, fileName, mimetype: guessMime(fileName), caption: t(c.caption) || undefined };
     }
 
     case 'message.buttons': {
       const list = Array.isArray(c.buttons) ? (c.buttons as { id: string; label: string }[]) : [];
       if (!t(c.body).trim() || list.length === 0) return null;
-      return {
-        text: t(c.body),
-        interactiveButtons: list.map((btn) => nativeButton('reply', interpolate(btn.label, ctx), btn.id)),
-      } as unknown as AnyMessageContent;
+      return { kind: 'buttons', body: t(c.body), buttons: list.map((btn) => button({ ...btn, type: 'reply' })) };
     }
 
     case 'message.cta': {
       const list = Array.isArray(c.buttons) ? (c.buttons as { id: string; type: string; label: string; value: string }[]) : [];
       if (!t(c.body).trim() || list.length === 0) return null;
-      const interactiveButtons = list.map((btn) =>
-        nativeButton(btn.type, interpolate(btn.label, ctx), btn.type === 'reply' ? btn.id : btn.value)
-      );
-      const footer = t(c.footer) || undefined;
-      const header = s(c.headerImage).trim();
-      // With a media header Baileys builds an image-header interactive card:
-      // the body text moves to `caption`. Without it, a plain text header.
-      if (header) {
-        return { image: { url: header }, caption: t(c.body), footer, interactiveButtons } as unknown as AnyMessageContent;
-      }
-      return { text: t(c.body), footer, interactiveButtons } as unknown as AnyMessageContent;
+      return {
+        kind: 'cta',
+        body: t(c.body),
+        footer: t(c.footer) || undefined,
+        headerImageUrl: safeUrl(s(c.headerImage)) || undefined,
+        buttons: list.map(button),
+      };
     }
 
     case 'message.list': {
       const sections = Array.isArray(c.sections) ? (c.sections as { title: string; rows: { id: string; title: string; description: string }[] }[]) : [];
       if (!t(c.title).trim() || sections.every((sec) => sec.rows.length === 0)) return null;
       return {
-        text: t(c.body) || t(c.title),
+        kind: 'list',
+        body: t(c.body) || t(c.title),
         title: t(c.title) || undefined,
         buttonText: s(c.buttonText) || 'Ver opções',
         sections: sections.map((sec) => ({
           title: interpolate(sec.title, ctx),
-          rows: sec.rows.map((r) => ({ rowId: r.id, title: interpolate(r.title, ctx), description: interpolate(r.description, ctx) || undefined })),
+          rows: sec.rows.map((r) => ({ id: r.id, title: interpolate(r.title, ctx), description: interpolate(r.description, ctx) || undefined })),
         })),
-      } as unknown as AnyMessageContent;
+      };
     }
 
     case 'message.carousel': {
       const cards = Array.isArray(c.cards) ? (c.cards as { id: string; title: string; imageUrl: string; buttonLabel: string }[]) : [];
       if (cards.length === 0) return null;
       return {
-        text: ' ',
+        kind: 'carousel',
         cards: cards.map((card) => ({
-          image: card.imageUrl ? { url: card.imageUrl } : undefined,
+          id: card.id,
           title: interpolate(card.title, ctx),
-          buttons: [nativeButton('reply', interpolate(card.buttonLabel, ctx) || 'Ver', card.id)],
+          imageUrl: safeUrl(card.imageUrl) || undefined,
+          buttonLabel: interpolate(card.buttonLabel, ctx) || 'Ver',
         })),
-      } as unknown as AnyMessageContent;
+      };
     }
 
     case 'payment.pix': {
@@ -138,56 +173,71 @@ export function buildMessageContent(node: IFlowNode, ctx: FlowContext): AnyMessa
       // copies the Pix key / copia-e-cola code. Same engine path as message.cta.
       const key = String(c.pixKey ?? '').trim();
       if (!key) return null;
-      const label = t(c.buttonLabel).trim() || 'Copiar chave Pix';
-      const body = t(c.body).trim() || '💠 Pagamento via Pix';
-      const footer = t(c.footer) || undefined;
-      const interactiveButtons = [nativeButton('copy', label, key)];
-      const qr = s(c.qrCodeUrl).trim();
-      if (qr) return { image: { url: qr }, caption: body, footer, interactiveButtons } as unknown as AnyMessageContent;
-      return { text: body, footer, interactiveButtons } as unknown as AnyMessageContent;
+      return {
+        kind: 'pix',
+        body: t(c.body).trim() || '💠 Pagamento via Pix',
+        footer: t(c.footer) || undefined,
+        qrCodeUrl: safeUrl(s(c.qrCodeUrl)) || undefined,
+        buttonLabel: t(c.buttonLabel).trim() || 'Copiar chave Pix',
+        pixKey: key,
+      };
     }
 
     case 'message.poll': {
-      const name = t(c.question).trim();
-      const values = Array.isArray(c.options)
+      const question = t(c.question).trim();
+      const options = Array.isArray(c.options)
         ? (c.options as { text: string }[]).map((o) => interpolate(String(o?.text ?? ''), ctx).trim()).filter(Boolean)
         : [];
-      if (!name || values.length < 2) return null;
-      const selectableCount = b(c.multiSelect) ? values.length : 1;
-      return { poll: { name, values, selectableCount } } as unknown as AnyMessageContent;
+      if (!question || options.length < 2) return null;
+      return { kind: 'poll', question, options, multiSelect: b(c.multiSelect) };
     }
 
     case 'message.location': {
       const lat = Number(c.latitude);
       const lng = Number(c.longitude);
       if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
-      return { location: { degreesLatitude: lat, degreesLongitude: lng, name: t(c.name) || undefined, address: t(c.address) || undefined } } as AnyMessageContent;
+      return { kind: 'location', latitude: lat, longitude: lng, name: t(c.name) || undefined, address: t(c.address) || undefined };
     }
 
     case 'message.contact': {
       const name = t(c.name).trim();
-      const phoneRaw = String(c.phone ?? '').trim();
-      if (!name || !phoneRaw) return null;
-      const waid = phoneRaw.replace(/\D/g, '');
-      const org = t(c.organization).trim();
-      const vcard = [
-        'BEGIN:VCARD', 'VERSION:3.0', `FN:${name}`,
-        org ? `ORG:${org}` : '',
-        `TEL;type=CELL;type=VOICE;waid=${waid}:${phoneRaw}`,
-        'END:VCARD',
-      ].filter(Boolean).join('\n');
-      return { contacts: { displayName: name, contacts: [{ displayName: name, vcard }] } } as unknown as AnyMessageContent;
+      const phone = String(c.phone ?? '').trim();
+      if (!name || !phone) return null;
+      return { kind: 'contact', name, phone, organization: t(c.organization).trim() || undefined };
     }
 
-    case 'message.template':
-      // Meta approved templates need template infra; fall back to a plain text stub.
-      return { text: `[template: ${s(c.templateId)}]` };
+    case 'message.reaction': {
+      const key = c.target === 'trigger' ? (ctx.triggerKey ?? ctx.lastInboundKey) : ctx.lastInboundKey;
+      if (!key) return null;
+      return { kind: 'reaction', emoji: s(c.emoji) || '👍', key };
+    }
 
-    case 'message.reaction':
-      if (!ctx.lastInboundKey) return null;
-      return { react: { text: s(c.emoji) || '👍', key: ctx.lastInboundKey } } as AnyMessageContent;
+    case 'message.template': {
+      // Cloud API only (see toBaileys, which returns null for this kind) — an
+      // approved HSM template, variables filled with interpolated strings so
+      // {{nome}}/{{telefone}}/saved flow variables work inside a template param
+      // the same way they do in every other block.
+      const templateName = s(c.templateName).trim();
+      const language = s(c.language).trim();
+      if (!templateName || !language) return null;
+      const variables = Array.isArray(c.variables) ? (c.variables as unknown[]) : [];
+      const components = variables.length
+        ? [{ type: 'body', parameters: variables.map((v) => ({ type: 'text', text: t(v) })) }]
+        : undefined;
+      return { kind: 'template', templateName, language, components };
+    }
 
     default:
       return null; // condition / action / attendance / crm / ai / automation → runner handles
   }
+}
+
+/**
+ * Baileys-shaped call site kept for backward compatibility — every existing
+ * caller (flow runner, campaigns) wants `AnyMessageContent` directly and is
+ * Baileys-only today. Equivalent to `toBaileys(await buildOutboundMessage(...))`.
+ */
+export async function buildMessageContent(node: IFlowNode, ctx: FlowContext, workspaceId: string): Promise<AnyMessageContent | null> {
+  const msg = await buildOutboundMessage(node, ctx, workspaceId);
+  return msg ? toBaileys(msg) : null;
 }

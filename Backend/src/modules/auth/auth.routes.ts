@@ -128,7 +128,9 @@ export async function authRoutes(fastify: FastifyInstance, opts: { wsGateway: We
 
   // GET /api/auth/avatar/:userId — public (no auth needed, same exposure as a WhatsApp
   // contact photo): serves the raw image bytes for <img src> everywhere avatarUrl is rendered.
-  fastify.get('/avatar/:userId', async (request, reply) => {
+  // A tight per-route limit (well below the global anonymous bucket) makes scraping/
+  // enumerating ObjectIds impractical without requiring auth on a route <img src> relies on.
+  fastify.get('/avatar/:userId', { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } }, async (request, reply) => {
     const { userId } = request.params as { userId: string };
     // Not .lean() — Mongoose's schema casting turns the stored BSON Binary back into a real
     // Buffer here; a lean query would hand back the raw Binary wrapper instead (see the media

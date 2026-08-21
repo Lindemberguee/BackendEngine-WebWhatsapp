@@ -29,10 +29,10 @@ class WebSocketClient extends types_1.AbstractSocketClient {
         return this.socket?.readyState === ws_1.default.CLOSED
     }
     get isClosing() {
-        this.socket?.readyState === ws_1.default.CLOSING
+        return this.socket?.readyState === ws_1.default.CLOSING
     }
     get isConnecting() {
-        this.socket?.readyState === ws_1.default.CONNECTING
+        return this.socket?.readyState === ws_1.default.CONNECTING
     }
     async connect() {
         if (this.socket) {

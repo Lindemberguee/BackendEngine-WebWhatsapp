@@ -1061,9 +1061,14 @@ const makeChatsSocket = (config) => {
     ws.on('CB:presence', handlePresenceUpdate)
     ws.on('CB:chatstate', handlePresenceUpdate)
     ws.on('CB:ib,,dirty', async (node) => {
-        const { attrs } = WABinary_1.getBinaryNodeChild(node, 'dirty')
+      try {
+        const dirtyNode = WABinary_1.getBinaryNodeChild(node, 'dirty')
+        if (!dirtyNode) {
+            return
+        }
+        const { attrs } = dirtyNode
         const type = attrs.type
-        
+
         switch (type) {
             case 'account_sync':
                 if (attrs.timestamp) {
@@ -1083,6 +1088,9 @@ const makeChatsSocket = (config) => {
                 logger.info({ node }, 'received unknown sync')
                 break
         }
+      } catch (err) {
+        onUnexpectedError(err, 'handling dirty sync')
+      }
     })
     
     ev.on('connection.update', ({ connection, receivedPendingNotifications }) => {

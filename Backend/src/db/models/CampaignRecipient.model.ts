@@ -18,6 +18,12 @@ export interface ICampaignRecipient extends Document {
   sentAt?: Date;
   /** Set the first time this contact replies after receiving the campaign message. */
   repliedAt?: Date;
+  /** Estimated Meta cost of this specific send, from the platform's rate card
+   *  at send time (not Meta's own billing — Meta has no live quote API). Only
+   *  set for successful cloud_api template sends; recipients that were
+   *  skipped/failed never cost anything and are left undefined. */
+  estimatedCostCents?: number;
+  estimatedCostCurrency?: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -37,6 +43,8 @@ const CampaignRecipientSchema = new Schema<ICampaignRecipient>(
     skipReason:     { type: String, enum: ['blocked', 'opted_out', 'invalid_number'] },
     sentAt:         { type: Date },
     repliedAt:      { type: Date },
+    estimatedCostCents:    { type: Number },
+    estimatedCostCurrency: { type: String },
   },
   { timestamps: true }
 );

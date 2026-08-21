@@ -6,6 +6,7 @@ export type NotificationType =
   | 'flow.published' | 'flow.run_failed' | 'flow.transferred_to_human' | 'flow.custom'
   | 'team.invited' | 'team.role_changed' | 'team.password_reset'
   | 'instance.disconnected' | 'instance.qr_expired' | 'instance.banned' | 'instance.connected'
+  | 'instance.health_failed' | 'instance.token_expiring'
   | 'billing.plan_changed'
   | 'security.new_login'
   | 'campaign.completed'

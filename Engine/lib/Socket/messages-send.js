@@ -1774,6 +1774,7 @@ const makeMessagesSocket = (config) => {
                 if (config.emitOwnEvents) {
                     process.nextTick(() => {
                         processingMutex.mutex(() => (upsertMessage(fullMsg, 'append')))
+                            .catch(err => suki.onUnexpectedError(err, 'upserting own sent message'))
                     })
                 }
 
