@@ -27,7 +27,12 @@ export async function connectDatabase(logger: FastifyBaseLogger = fallbackLogger
   // Migrate the legacy one-thread-per-contact index to one thread per business
   // number. Contact identity remains unified in the Contact collection.
   const conversations = mongoose.connection.collection('conversations');
-  const indexes = await conversations.indexes();
+  // On a brand-new database the collection has never been created, and MongoDB
+  // throws NamespaceNotFound (code 26) rather than returning an empty list.
+  const indexes = await conversations.indexes().catch((err) => {
+    if (err?.codeName === 'NamespaceNotFound' || err?.code === 26) return [];
+    throw err;
+  });
   const legacy = indexes.find((idx) => idx.name === 'workspaceId_1_jid_1' && idx.unique);
   if (legacy) await conversations.dropIndex(legacy.name!);
   await conversations.createIndex({ workspaceId: 1, jid: 1 }, { name: 'workspaceId_1_jid_1' });
