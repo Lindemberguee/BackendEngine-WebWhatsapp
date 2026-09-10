@@ -150,10 +150,12 @@ export async function buildReportSummary(filters: ReportFilters): Promise<Report
   // Resolved in range: conversations actually closed during [from, to] — may have been
   // created before the period started, that's expected for a "closures" cohort.
   const resolvedMatch = { ...baseFilter, status: 'resolved', resolvedAt: { $gte: from, $lte: to } };
-  // Open / blocked are current-state snapshots, not time-bound events — but
-  // still scoped to the "created in range" cohort (not a global count) so
-  // every column in the same table row is about the same set of conversations
-  // and the numbers don't silently ignore the date filter.
+  // "Open now" is a live snapshot, deliberately NOT date-bound: it answers
+  // "how much is on the table right now" (the KPI card is even labelled
+  // "atual"/"agora"), so a conversation opened before the period still counts.
+  // "Blocked", by contrast, is scoped to the created-in-range cohort below
+  // (it runs off `createdMatch`), because it's a property of that cohort, not
+  // a workspace-wide live figure.
   const openMatch = { ...baseFilter, status: 'open' };
 
   // Previous period of equal length, for the delta arrows on the KPI cards.
