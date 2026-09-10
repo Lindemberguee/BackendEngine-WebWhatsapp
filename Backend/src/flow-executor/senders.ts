@@ -169,17 +169,40 @@ export async function buildOutboundMessage(node: IFlowNode, ctx: FlowContext, wo
     }
 
     case 'payment.pix': {
-      // Pix = interactive card: QR image header + text + a "copy" button that
-      // copies the Pix key / copia-e-cola code. Same engine path as message.cta.
-      const key = String(c.pixKey ?? '').trim();
-      if (!key) return null;
+      // Charge card: auto-composed header (nº/valor/vencimento) + free text +
+      // optional boleto PDF link + 1-2 "copy" buttons. Same engine path as cta.
+      const pixCode = t(c.pixKey).trim();
+      const hasBoleto = b(c.hasBoleto);
+      const boletoCode = hasBoleto ? t(c.boletoCode).trim() : '';
+      if (!pixCode && !boletoCode) return null;
+
+      const chargeId = t(c.chargeId).trim();
+      const amount = t(c.amount).trim();
+      const dueDate = t(c.dueDate).trim();
+      const pdfUrl = hasBoleto ? safeUrl(s(c.boletoPdfUrl)) : '';
+
+      const header = [
+        chargeId && `🧾 Cobrança ${chargeId}`,
+        amount && `💰 Total: R$ ${amount}`,
+        dueDate && `📅 Vencimento: ${dueDate}`,
+      ].filter(Boolean).join('\n');
+
+      const body = [
+        header,
+        t(c.body).trim(),
+        pdfUrl && `📄 Boleto (PDF): ${pdfUrl}`,
+      ].filter(Boolean).join('\n\n') || '💠 Pagamento';
+
+      const buttons: { label: string; code: string }[] = [];
+      if (pixCode) buttons.push({ label: t(c.pixButtonLabel).trim() || t(c.buttonLabel).trim() || 'Copiar código Pix', code: pixCode });
+      if (boletoCode) buttons.push({ label: t(c.boletoButtonLabel).trim() || 'Copiar código do boleto', code: boletoCode });
+
       return {
         kind: 'pix',
-        body: t(c.body).trim() || '💠 Pagamento via Pix',
+        body,
         footer: t(c.footer) || undefined,
         qrCodeUrl: safeUrl(s(c.qrCodeUrl)) || undefined,
-        buttonLabel: t(c.buttonLabel).trim() || 'Copiar chave Pix',
-        pixKey: key,
+        buttons,
       };
     }
 

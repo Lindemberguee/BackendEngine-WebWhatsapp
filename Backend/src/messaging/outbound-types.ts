@@ -25,7 +25,9 @@ export type OutboundMessage =
   | { kind: 'cta'; body: string; footer?: string; headerImageUrl?: string; buttons: OutboundButton[] }
   | { kind: 'list'; body: string; title?: string; buttonText: string; sections: { title: string; rows: { id: string; title: string; description?: string }[] }[] }
   | { kind: 'carousel'; cards: { id: string; title: string; imageUrl?: string; buttonLabel: string }[] }
-  | { kind: 'pix'; body: string; footer?: string; qrCodeUrl?: string; buttonLabel: string; pixKey: string }
+  /** A charge card: QR image header (optional) + text + 1-2 "copy" buttons
+   *  (Pix copia-e-cola and/or boleto linha digitável). Same engine path as `cta`. */
+  | { kind: 'pix'; body: string; footer?: string; qrCodeUrl?: string; buttons: { label: string; code: string }[] }
   | { kind: 'poll'; question: string; options: string[]; multiSelect: boolean }
   | { kind: 'location'; latitude: number; longitude: number; name?: string; address?: string }
   | { kind: 'contact'; name: string; phone: string; organization?: string }

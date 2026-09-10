@@ -99,9 +99,10 @@ export function toCloudApi(msg: OutboundMessage): CloudApiMessageBody | null {
     }
 
     case 'pix': {
-      // No "copy code" interactive button on the Cloud API — send the Pix key as
+      // No "copy code" interactive button on the Cloud API — send each code as
       // plain text so it's still copyable by the customer, just not one-tap.
-      const text = [msg.body, `${msg.buttonLabel}: ${msg.pixKey}`, msg.footer].filter(Boolean).join('\n\n');
+      const codeLines = msg.buttons.map((b) => `${b.label}: ${b.code}`);
+      const text = [msg.body, ...codeLines, msg.footer].filter(Boolean).join('\n\n');
       return { type: 'text', text: { body: text, preview_url: false } };
     }
 

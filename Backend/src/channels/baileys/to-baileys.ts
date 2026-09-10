@@ -66,7 +66,7 @@ export function toBaileys(msg: OutboundMessage): AnyMessageContent | null {
       } as unknown as AnyMessageContent;
 
     case 'pix': {
-      const interactiveButtons = [nativeButton({ type: 'copy', label: msg.buttonLabel, value: msg.pixKey })];
+      const interactiveButtons = msg.buttons.map((b) => nativeButton({ type: 'copy', label: b.label, value: b.code }));
       if (msg.qrCodeUrl) return { image: { url: msg.qrCodeUrl }, caption: msg.body, footer: msg.footer, interactiveButtons } as unknown as AnyMessageContent;
       return { text: msg.body, footer: msg.footer, interactiveButtons } as unknown as AnyMessageContent;
     }

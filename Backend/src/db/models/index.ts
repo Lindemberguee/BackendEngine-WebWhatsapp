@@ -29,7 +29,9 @@ export { ScheduledMessage } from './ScheduledMessage.model';
 export { WhatsAppTemplate } from './WhatsAppTemplate.model';
 export { MetaWebhookEvent } from './MetaWebhookEvent.model';
 export { PricingRate } from './PricingRate.model';
+export { FlowAsset } from './FlowAsset.model';
 
+export type { IFlowAsset } from './FlowAsset.model';
 export type { IWorkspace } from './Workspace.model';
 export type { IUser, UserRole, IUserStatus, UserAvailability } from './User.model';
 export type { IInstance, InstanceStatus } from './Instance.model';

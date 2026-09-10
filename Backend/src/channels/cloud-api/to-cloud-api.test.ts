@@ -50,10 +50,18 @@ describe('toCloudApi', () => {
     expect(out.text.body).toContain('rodapé');
   });
 
-  it('pix embeds the key as copyable text (no copy-button equivalent)', () => {
-    const out = toCloudApi({ kind: 'pix', body: 'Pague', buttonLabel: 'Copiar chave', pixKey: 'abc123' }) as { type: string; text: { body: string } };
+  it('pix embeds each code as copyable text (no copy-button equivalent)', () => {
+    const out = toCloudApi({
+      kind: 'pix',
+      body: 'Pague',
+      buttons: [
+        { label: 'Copiar código Pix', code: 'abc123' },
+        { label: 'Copiar código do boleto', code: '00190000090123' },
+      ],
+    }) as { type: string; text: { body: string } };
     expect(out.type).toBe('text');
     expect(out.text.body).toContain('abc123');
+    expect(out.text.body).toContain('00190000090123');
   });
 
   it('carousel and poll are unsupported on the Cloud API (real-time messages)', () => {

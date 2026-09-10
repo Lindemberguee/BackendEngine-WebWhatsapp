@@ -25,6 +25,7 @@ import { quickRepliesRoutes } from './modules/quick-replies/quick-replies.routes
 import { closeReasonsRoutes } from './modules/close-reasons/close-reasons.routes';
 import { flowsRoutes } from './modules/flows/flows.routes';
 import { flowFoldersRoutes } from './modules/flows/flow-folders.routes';
+import { flowAssetsRoutes } from './modules/flows/flow-assets.routes';
 import { teamRoutes } from './modules/team/team.routes';
 import { crmRoutes } from './modules/crm/crm.routes';
 import { workspacesRoutes } from './modules/workspaces/workspaces.routes';
@@ -275,6 +276,7 @@ async function bootstrap(): Promise<void> {
   fastify.register(closeReasonsRoutes,  { prefix: '/api/close-reasons' });
   fastify.register(flowsRoutes,         { prefix: '/api/flows', wsGateway });
   fastify.register(flowFoldersRoutes,   { prefix: '/api/flow-folders' });
+  fastify.register(flowAssetsRoutes,    { prefix: '/api/flow-assets' });
   fastify.register(teamRoutes,          { prefix: '/api/team', wsGateway });
   fastify.register(crmRoutes,           { prefix: '/api/crm', sessionManager, wsGateway });
   fastify.register(workspacesRoutes,    { prefix: '/api/workspaces', wsGateway });
