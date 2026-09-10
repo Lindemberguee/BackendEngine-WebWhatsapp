@@ -378,7 +378,10 @@ export class FlowRunner {
       if (node.blockType.startsWith('message.') || node.blockType.startsWith('payment.')) {
         const content = await buildMessageContent(node, ctx, run.workspaceId.toString());
         if (content) {
-          try { await this.deps.sendMessage(run.jid, content); }
+          try {
+            await this.deps.sendMessage(run.jid, content);
+            logger.info({ node: node.id, blockType: node.blockType }, '[flow] message/payment block sent');
+          }
           catch (err) {
             // Media blocks fail here when the URL isn't reachable by the server
             // (page links, blob:, localhost, 403/404). Surface the real reason
@@ -386,6 +389,14 @@ export class FlowRunner {
             const reason = err instanceof Error ? err.message : String(err);
             logger.error({ node: node.id, blockType: node.blockType, reason }, '[flow] send failed — se for mídia, verifique se a URL é um link público direto para o arquivo');
           }
+        } else {
+          // Block produced no message — a required field is empty (Pix key /
+          // boleto code, message text) or a media URL failed the public-URL gate.
+          // Previously this was skipped with no trace, so the run just moved on.
+          logger.warn(
+            { node: node.id, blockType: node.blockType, config: node.config },
+            '[flow] message/payment block produced no content — bloco pulado (campo obrigatório vazio ou URL de mídia inválida)'
+          );
         }
         const ports = waitingPorts(node);
         if (ports && ports.length) {
