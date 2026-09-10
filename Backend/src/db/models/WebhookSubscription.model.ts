@@ -32,4 +32,15 @@ const WebhookSubscriptionSchema = new Schema<IWebhookSubscription>(
 WebhookSubscriptionSchema.index({ workspaceId: 1 });
 WebhookSubscriptionSchema.index({ workspaceId: 1, enabled: 1, events: 1 });
 
+WebhookSubscriptionSchema.set('toJSON', {
+  virtuals: true,
+  transform: (_doc, ret) => {
+    const r = ret as unknown as Record<string, unknown>;
+    r.id = (r._id as { toString(): string } | undefined)?.toString();
+    delete r._id;
+    delete r.__v;
+    return r;
+  },
+});
+
 export const WebhookSubscription = model<IWebhookSubscription>('WebhookSubscription', WebhookSubscriptionSchema);

@@ -114,8 +114,16 @@ async function bootstrap(): Promise<void> {
   await connectDatabase(fastify.log);
 
   // ── Plugins ───────────────────────────────────────────────────────────────
+  // CORS_ORIGIN accepts a comma-separated list so one deploy can serve several
+  // front-ends (e.g. local dev + the VM's public IP). @fastify/cors matches an
+  // array by exact string, so each entry must be a full origin with scheme and
+  // port — "localhost" and "127.0.0.1" are distinct origins to the browser.
+  const corsOrigins = (process.env.CORS_ORIGIN ?? 'http://localhost:3000')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean);
   await fastify.register(cors, {
-    origin: process.env.CORS_ORIGIN ?? 'http://localhost:3000',
+    origin: corsOrigins.length === 1 ? corsOrigins[0] : corsOrigins,
     credentials: true,
     methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   });
