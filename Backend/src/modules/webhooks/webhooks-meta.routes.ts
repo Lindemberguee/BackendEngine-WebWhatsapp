@@ -253,7 +253,10 @@ export async function webhooksMetaRoutes(
       : metadataPhoneId
         ? await Instance.findOne({ channel: 'cloud_api', 'cloudApi.phoneNumberId': metadataPhoneId })
         : eventWabaId ? await Instance.findOne({ channel: 'cloud_api', 'cloudApi.wabaId': eventWabaId }) : null;
-    if (!instance?.cloudApi || instance.channel !== 'cloud_api') return reply.status(404).send({ error: 'Instância não encontrada' });
+    if (!instance?.cloudApi || instance.channel !== 'cloud_api') {
+      logger.warn({ instanceId, metadataPhoneId, eventWabaId, object: json.object }, '[webhooks/meta] no matching cloud_api instance for inbound webhook');
+      return reply.status(404).send({ error: 'Instância não encontrada' });
+    }
     if (metadataPhoneId && metadataPhoneId !== instance.cloudApi.phoneNumberId) return reply.status(403).send({ error: 'Phone Number ID não corresponde à instância' });
     if (!metadataPhoneId && eventWabaId !== instance.cloudApi.wabaId) return reply.status(403).send({ error: 'WABA ID não corresponde à instância' });
 
