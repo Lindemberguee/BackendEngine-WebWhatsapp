@@ -65,6 +65,11 @@ if (process.env.SENTRY_DSN) {
 // ── Bootstrap ──────────────────────────────────────────────────────────────────
 
 const fastify = Fastify({
+  // Meta's webhook delivery (and its dashboard "Verify and save" check) always
+  // calls the callback URL without a trailing slash. Without this, Fastify
+  // treats "/api/webhooks/meta" and "/api/webhooks/meta/" as distinct routes
+  // and the exact one Meta calls 404s.
+  ignoreTrailingSlash: true,
   logger: {
     level: process.env.LOG_LEVEL ?? 'info',
     ...(process.env.NODE_ENV !== 'production' ? {
