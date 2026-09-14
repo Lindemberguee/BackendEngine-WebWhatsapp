@@ -20,9 +20,12 @@ export interface IInstance extends Document {
   status: InstanceStatus;
   qrCode?: string;       // base64 PNG
   pairingCode?: string;  // 8-digit code
-  // Baileys auth state stored directly in document
-  authCreds?: Record<string, unknown>;
-  authKeys?: Record<string, Record<string, unknown>>;
+  // Baileys auth state (Signal Protocol session material) stored directly in the
+  // document. Written as AES-256-GCM ciphertext strings via MongoAuthState.ts
+  // (see shared/crypto.ts) — a plain object here means pre-encryption legacy
+  // data, still readable, re-encrypted on its next natural write.
+  authCreds?: Record<string, unknown> | string;
+  authKeys?: Record<string, Record<string, unknown> | string>;
   webhookUrl?: string;
   lastConnectedAt?: Date;
   lastDisconnectedAt?: Date;

@@ -5,6 +5,28 @@
 import type { AuthenticationCreds, SignalDataTypeMap, SignalKeyStore } from '@webwhatsapp/engine';
 import { initAuthCreds, BufferJSON } from '@webwhatsapp/engine';
 import { Instance } from '../db/models';
+import { encryptSecret, decryptSecret } from '../shared/crypto';
+
+// Baileys creds/keys are the Signal Protocol session material for the linked
+// WhatsApp number — equivalent to a full session takeover if read off the
+// database directly, so they're encrypted at rest the same way Cloud API
+// tokens are (AES-256-GCM, see shared/crypto.ts). New values are always
+// written encrypted (`v1:...` ciphertext string); a value that ISN'T in that
+// format is treated as pre-encryption legacy plaintext and read as-is, so
+// already-linked sessions keep working and get encrypted on their next
+// natural write instead of needing a forced migration or QR re-scan.
+function isCiphertext(value: unknown): value is string {
+  return typeof value === 'string' && value.startsWith('v1:');
+}
+
+function decodeStored<T>(raw: unknown): T {
+  const json = isCiphertext(raw) ? decryptSecret(raw) : JSON.stringify(raw);
+  return JSON.parse(json, BufferJSON.reviver) as T;
+}
+
+function encodeForStorage(value: unknown): string {
+  return encryptSecret(JSON.stringify(value, BufferJSON.replacer));
+}
 
 type KeyType = keyof SignalDataTypeMap;
 
@@ -35,7 +57,7 @@ export async function useMongoAuthState(instanceId: string): Promise<{
 
   // Initialize creds if empty
   const creds: AuthenticationCreds = instance.authCreds
-    ? JSON.parse(JSON.stringify(instance.authCreds), BufferJSON.reviver)
+    ? decodeStored<AuthenticationCreds>(instance.authCreds)
     : initAuthCreds();
 
   const keys: SignalKeyStore = {
@@ -47,7 +69,7 @@ export async function useMongoAuthState(instanceId: string): Promise<{
       for (const id of ids) {
         const raw = bucket[encodeKeyId(id)];
         if (raw !== undefined && raw !== null) {
-          result[id] = JSON.parse(JSON.stringify(raw), BufferJSON.reviver) as SignalDataTypeMap[T];
+          result[id] = decodeStored<SignalDataTypeMap[T]>(raw);
         }
       }
       return result;
@@ -63,7 +85,7 @@ export async function useMongoAuthState(instanceId: string): Promise<{
           if (value === null || value === undefined) {
             unsetOps[path] = '';
           } else {
-            setOps[path] = JSON.parse(JSON.stringify(value, BufferJSON.replacer));
+            setOps[path] = encodeForStorage(value);
           }
         }
       }
@@ -81,7 +103,7 @@ export async function useMongoAuthState(instanceId: string): Promise<{
   const saveCreds = async () => {
     await Instance.updateOne(
       { _id: instanceId },
-      { $set: { authCreds: JSON.parse(JSON.stringify(creds, BufferJSON.replacer)) } }
+      { $set: { authCreds: encodeForStorage(creds) } }
     );
   };
 
