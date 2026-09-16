@@ -27,7 +27,7 @@ function cancelScheduledMessages(conversationId: string): void {
 }
 
 // Transform MongoDB conversation doc to API response format
-function toConversationResponse(doc: any, extra?: { instanceChannel?: string }) {
+function toConversationResponse(doc: any, extra?: { instanceChannel?: string; contactTags?: string[] }) {
   const name = doc.name || doc.phone || 'Unknown';
   const phone = doc.phone || '';
 
@@ -39,7 +39,10 @@ function toConversationResponse(doc: any, extra?: { instanceChannel?: string }) 
     status: doc.status || 'open',
     isGroup: doc.isGroup || false,
     unreadCount: doc.unreadCount || 0,
-    tags: doc.tags || [],
+    // Labels live on the Contact now (see the /tags routes below) — prefer those
+    // when known; doc.tags is only the source of truth for contact-less
+    // conversations (groups) or callers that didn't fetch the contact.
+    tags: extra?.contactTags ?? doc.tags ?? [],
     avatarUrl: doc.avatarUrl,
     contactId: doc.contactId?.toString(),
     lastMessage: doc.lastMessage ? {
@@ -225,7 +228,6 @@ export async function conversationsRoutes(fastify: FastifyInstance, opts: { sess
 
     const filter: Record<string, unknown> = { workspaceId };
     if (status && status !== 'all') filter.status = status;
-    if (tag) filter.tags = tag;
     if (assignedTo === 'me' || assigneeId === 'me') {
       filter.assignedAgentId = sub;
     } else if (assigneeId) {
@@ -245,6 +247,14 @@ export async function conversationsRoutes(fastify: FastifyInstance, opts: { sess
     // collect each as its own clause under $and instead of overwriting one another.
     const andConditions: Record<string, unknown>[] = [];
     if (slaBreached === 'true') andConditions.push({ $or: [{ slaFirstResponseBreached: true }, { slaResolutionBreached: true }] });
+
+    // Tags live on the Contact now — match either a conversation whose contact
+    // has this tag, or (contact-less conversations, e.g. groups) the
+    // conversation's own legacy tags field directly.
+    if (tag) {
+      const taggedContacts = await Contact.find({ workspaceId, tags: tag }, { _id: 1 }).lean();
+      andConditions.push({ $or: [{ contactId: { $in: taggedContacts.map((c) => c._id) } }, { tags: tag }] });
+    }
 
     // showBlocked: filter conversations where the associated contact is blocked
     if (showBlocked === 'true') {
@@ -277,25 +287,23 @@ export async function conversationsRoutes(fastify: FastifyInstance, opts: { sess
       Conversation.countDocuments(filter),
     ]);
 
-    // Batch-fetch contact info (avatarUrl + status) for all conversations
+    // Batch-fetch contact info (avatarUrl + status + tags) for all conversations —
+    // tags live on the Contact (see the /tags routes), so the list needs this to
+    // show the same labels as the Contacts module instead of the conversation's
+    // own (legacy, contact-less-only) tags field.
     const contactIds = convDocs.filter(c => c.contactId).map(c => c.contactId!);
-    let contactInfoMap = new Map<string, { avatarUrl?: string; status?: string }>();
+    let contactInfoMap = new Map<string, { avatarUrl?: string; status?: string; tags?: string[] }>();
     if (contactIds.length > 0) {
-      const contacts = await Contact.find({ _id: { $in: contactIds } }, { avatarUrl: 1, status: 1 }).lean();
-      contactInfoMap = new Map(contacts.map(c => [c._id.toString(), { avatarUrl: c.avatarUrl, status: c.status as string | undefined }]));
+      const contacts = await Contact.find({ _id: { $in: contactIds } }, { avatarUrl: 1, status: 1, tags: 1 }).lean();
+      contactInfoMap = new Map(contacts.map(c => [c._id.toString(), { avatarUrl: c.avatarUrl, status: c.status as string | undefined, tags: c.tags }]));
     }
 
     const data = convDocs.map(doc => {
       const d = doc as typeof doc & { _contactStatus?: string };
-      if (doc.contactId) {
-        const info = contactInfoMap.get(doc.contactId.toString());
-        if (info?.status) d._contactStatus = info.status;
-      }
-      const res = toConversationResponse(d);
-      if (!res.avatarUrl && doc.contactId) {
-        const info = contactInfoMap.get(doc.contactId.toString());
-        if (info?.avatarUrl) res.avatarUrl = info.avatarUrl;
-      }
+      const info = doc.contactId ? contactInfoMap.get(doc.contactId.toString()) : undefined;
+      if (info?.status) d._contactStatus = info.status;
+      const res = toConversationResponse(d, { contactTags: info?.tags });
+      if (!res.avatarUrl && info?.avatarUrl) res.avatarUrl = info.avatarUrl;
       return res;
     });
 
@@ -309,14 +317,21 @@ export async function conversationsRoutes(fastify: FastifyInstance, opts: { sess
   fastify.get('/:id', auth, async (request, reply) => {
     const { workspaceId, sub, role } = request.user as { workspaceId: string; sub: string; role: string };
     const { id } = request.params as { id: string };
-    const conv = await Conversation.findOne(scopeConversationFilter({ _id: id, workspaceId }, { role, sub })).populate('assignedAgentId', 'name avatarUrl');
+    const conv = await Conversation.findOne(scopeConversationFilter({ _id: id, workspaceId }, { role, sub }))
+      .populate('assignedAgentId', 'name avatarUrl')
+      .populate('teamGroupId', 'name emoji color');
     if (!conv) return reply.status(404).send({ error: 'Conversa não encontrada' });
     let instanceChannel: string | undefined;
     if (conv.instanceId) {
       const inst = await Instance.findById(conv.instanceId).select('channel').lean();
       instanceChannel = inst?.channel ?? 'baileys';
     }
-    return reply.send(toConversationResponse(conv, { instanceChannel }));
+    let contactTags: string[] | undefined;
+    if (conv.contactId) {
+      const contact = await Contact.findById(conv.contactId).select('tags').lean();
+      contactTags = contact?.tags;
+    }
+    return reply.send(toConversationResponse(conv, { instanceChannel, contactTags }));
   });
 
   // PATCH /api/conversations/:id
@@ -414,7 +429,8 @@ export async function conversationsRoutes(fastify: FastifyInstance, opts: { sess
     const visibilityFilter = scopeConversationFilter({ _id: id, workspaceId }, { role, sub: actorId });
     const before = await Conversation.findOne(visibilityFilter).select('assignedAgentId');
     const conv = await Conversation.findOneAndUpdate(visibilityFilter, { assignedAgentId: valid }, { new: true })
-      .populate('assignedAgentId', 'name avatarUrl');
+      .populate('assignedAgentId', 'name avatarUrl')
+      .populate('teamGroupId', 'name emoji color');
     if (!conv) return reply.status(404).send({ error: 'Conversa não encontrada' });
 
     // Broadcast so every connected agent's inbox reflects the change immediately —
@@ -535,7 +551,12 @@ export async function conversationsRoutes(fastify: FastifyInstance, opts: { sess
     return reply.send(toConversationResponse(conv));
   });
 
-  // POST /api/conversations/:id/tags  — add a label (auto-creates it in the catalog)
+  // POST /api/conversations/:id/tags  — add a label (auto-creates it in the catalog).
+  // Labels are a property of the CONTACT (the person), not the conversation, so
+  // this writes to Contact.tags when the conversation has one linked — the same
+  // label then shows up on that contact everywhere (Contacts module, every one of
+  // their conversations). Conversations with no linked contact (e.g. groups) keep
+  // their own tags array as a fallback — there's no "person" to unify onto.
   fastify.post('/:id/tags', canWrite, async (request, reply) => {
     const { workspaceId, sub, role } = request.user as { workspaceId: string; sub: string; role: string };
     const { id } = request.params as { id: string };
@@ -544,17 +565,29 @@ export async function conversationsRoutes(fastify: FastifyInstance, opts: { sess
     const trimmed = (tag ?? '').trim();
     if (!trimmed) return reply.status(400).send({ error: 'Etiqueta é obrigatória' });
 
+    const existing = await Conversation.findOne(scopeConversationFilter({ _id: id, workspaceId }, { role, sub })).select('contactId');
+    if (!existing) return reply.status(404).send({ error: 'Conversa não encontrada' });
+
     await ensureLabel(workspaceId, trimmed);
-    const conv = await Conversation.findOneAndUpdate(
-      scopeConversationFilter({ _id: id, workspaceId }, { role, sub }),
-      { $addToSet: { tags: trimmed } },
-      { new: true }
-    );
+
+    let contactTags: string[] | undefined;
+    if (existing.contactId) {
+      const contact = await Contact.findOneAndUpdate(
+        { _id: existing.contactId, workspaceId },
+        { $addToSet: { tags: trimmed } },
+        { new: true }
+      ).select('tags');
+      contactTags = contact?.tags;
+    }
+    const conv = contactTags
+      ? existing
+      : await Conversation.findOneAndUpdate({ _id: id, workspaceId }, { $addToSet: { tags: trimmed } }, { new: true });
     if (!conv) return reply.status(404).send({ error: 'Conversa não encontrada' });
-    return reply.send(toConversationResponse(conv));
+    return reply.send(toConversationResponse(conv, { contactTags }));
   });
 
-  // DELETE /api/conversations/:id/tags/:tag  — remove a label from this conversation
+  // DELETE /api/conversations/:id/tags/:tag  — remove a label from the linked contact
+  // (or the conversation itself, for contact-less conversations — see POST above).
   fastify.delete('/:id/tags/:tag', canWrite, async (request, reply) => {
     const { workspaceId, sub, role } = request.user as { workspaceId: string; sub: string; role: string };
     const { id, tag } = request.params as { id: string; tag: string };
@@ -565,13 +598,23 @@ export async function conversationsRoutes(fastify: FastifyInstance, opts: { sess
       return reply.status(400).send({ error: 'Tag inválida' });
     }
 
-    const conv = await Conversation.findOneAndUpdate(
-      scopeConversationFilter({ _id: id, workspaceId }, { role, sub }),
-      { $pull: { tags: decodedTag } },
-      { new: true }
-    );
+    const existing = await Conversation.findOne(scopeConversationFilter({ _id: id, workspaceId }, { role, sub })).select('contactId');
+    if (!existing) return reply.status(404).send({ error: 'Conversa não encontrada' });
+
+    let contactTags: string[] | undefined;
+    if (existing.contactId) {
+      const contact = await Contact.findOneAndUpdate(
+        { _id: existing.contactId, workspaceId },
+        { $pull: { tags: decodedTag } },
+        { new: true }
+      ).select('tags');
+      contactTags = contact?.tags;
+    }
+    const conv = contactTags
+      ? existing
+      : await Conversation.findOneAndUpdate({ _id: id, workspaceId }, { $pull: { tags: decodedTag } }, { new: true });
     if (!conv) return reply.status(404).send({ error: 'Conversa não encontrada' });
-    return reply.send(toConversationResponse(conv));
+    return reply.send(toConversationResponse(conv, { contactTags }));
   });
 
   // DELETE /api/conversations/:id

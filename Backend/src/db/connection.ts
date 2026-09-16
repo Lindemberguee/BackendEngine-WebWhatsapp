@@ -40,6 +40,30 @@ export async function connectDatabase(logger: FastifyBaseLogger = fallbackLogger
     { workspaceId: 1, instanceId: 1, jid: 1 },
     { name: 'workspaceId_1_instanceId_1_jid_1', unique: true, sparse: true }
   );
+
+  await migrateConversationTagsToContact(logger);
+}
+
+// Labels used to live on both Conversation and Contact independently (a tag added
+// in a conversation never showed up on that contact's profile, and vice versa —
+// confusing since they share one catalog). Labels are now a Contact-only property
+// (see conversations.routes.ts's /tags routes); this carries over anything already
+// sitting on a conversation before that change shipped, so it isn't silently
+// orphaned. Idempotent — finds nothing left to do once everything's migrated.
+async function migrateConversationTagsToContact(logger: FastifyBaseLogger): Promise<void> {
+  const conversations = mongoose.connection.collection('conversations');
+  const contacts = mongoose.connection.collection('contacts');
+  const cursor = conversations.find(
+    { contactId: { $exists: true, $ne: null }, tags: { $exists: true, $not: { $size: 0 } } },
+    { projection: { contactId: 1, tags: 1 } }
+  );
+  let migrated = 0;
+  for await (const conv of cursor) {
+    await contacts.updateOne({ _id: conv.contactId }, { $addToSet: { tags: { $each: conv.tags } } });
+    await conversations.updateOne({ _id: conv._id }, { $set: { tags: [] } });
+    migrated++;
+  }
+  if (migrated > 0) logger.info({ migrated }, '[MongoDB] Merged legacy conversation tags into their contact');
 }
 
 export async function disconnectDatabase(logger: FastifyBaseLogger = fallbackLogger): Promise<void> {
