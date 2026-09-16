@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import { Types } from 'mongoose';
 import { Conversation, Message, Contact, Flow, FlowRun, Lead, Campaign } from '../../db/models';
 import { User } from '../../db/models/User.model';
+import { clampAnalyticsFrom } from '../billing/billing.service';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -73,6 +74,7 @@ export async function analyticsRoutes(fastify: FastifyInstance): Promise<void> {
       // default: 7d
       from = addDays(now, -7);
     }
+    from = await clampAnalyticsFrom(workspaceId, from);
 
     const span = Math.max(1, daysBetween(from, to));
     const prevFrom = addDays(from, -span);

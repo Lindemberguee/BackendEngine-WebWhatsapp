@@ -6,6 +6,7 @@ import type { WebhookEvent } from '../../db/models';
 import { requireRole } from '../../utils/require-role';
 import { isPublicHttpUrl } from '../../shared/url-security';
 import { parsePagination } from '../../utils/pagination';
+import { assertApiAccessEnabled } from '../billing/billing.service';
 
 function validEvents(events: unknown): WebhookEvent[] {
   return Array.isArray(events) ? events.filter((e): e is WebhookEvent => WEBHOOK_EVENTS.includes(e)) : [];
@@ -34,6 +35,11 @@ export async function webhooksRoutes(fastify: FastifyInstance): Promise<void> {
     if (!isPublicHttpUrl(url.trim())) return reply.status(400).send({ error: 'URL inválida ou aponta para um host interno' });
     const validatedEvents = validEvents(events);
     if (!validatedEvents.length) return reply.status(400).send({ error: 'Selecione ao menos um evento' });
+    try {
+      await assertApiAccessEnabled(workspaceId);
+    } catch (err) {
+      return reply.status(400).send({ error: (err as Error).message });
+    }
 
     const sub = await WebhookSubscription.create({
       workspaceId, url: url.trim(), events: validatedEvents, enabled: true,

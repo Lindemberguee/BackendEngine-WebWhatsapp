@@ -4,6 +4,7 @@ import { randomBytes, createHash } from 'crypto';
 import { ApiKey } from '../../db/models';
 import type { ApiKeyRole } from '../../db/models';
 import { requireRole } from '../../utils/require-role';
+import { assertApiAccessEnabled } from '../billing/billing.service';
 
 const ASSIGNABLE_ROLES: ApiKeyRole[] = ['admin', 'agent', 'viewer'];
 
@@ -34,6 +35,11 @@ export async function apiKeysRoutes(fastify: FastifyInstance): Promise<void> {
     const { workspaceId, sub } = request.user as { workspaceId: string; sub: string };
     const { name, role } = request.body as { name?: string; role?: string };
     if (!name?.trim()) return reply.status(400).send({ error: 'Nome é obrigatório' });
+    try {
+      await assertApiAccessEnabled(workspaceId);
+    } catch (err) {
+      return reply.status(400).send({ error: (err as Error).message });
+    }
     const resolvedRole = ASSIGNABLE_ROLES.includes(role as ApiKeyRole) ? (role as ApiKeyRole) : 'agent';
 
     const { fullKey, keyPrefix, keyHash } = generateKey();

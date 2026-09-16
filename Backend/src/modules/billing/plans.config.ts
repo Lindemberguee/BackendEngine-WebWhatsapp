@@ -15,6 +15,9 @@ export interface PlanLimits {
   campaignsEnabled: boolean;
   /** Meta WhatsApp Cloud API (BYO-WABA) as a connectable instance channel. */
   officialChannelEnabled: boolean;
+  /** Workspace-level API keys + outbound webhook subscriptions (integrations),
+   *  not the WhatsApp channel itself — see officialChannelEnabled for that. */
+  apiAccessEnabled: boolean;
   crmMultiPipeline: boolean;
   /** null = full history */
   analyticsRetentionDays: number | null;
@@ -32,7 +35,8 @@ export interface PlanDefinition {
   tier: PlanTier;
   name: string;
   description: string;
-  /** cents; null on enterprise — "fale com vendas", no public self-serve price */
+  /** cents; null means "fale com vendas" — no plan currently uses this, all
+   *  three (Essencial/Profissional/Business) have a public self-serve price. */
   monthlyPriceCents: number | null;
   annualPriceCents: number | null;
   limits: PlanLimits;
@@ -41,63 +45,74 @@ export interface PlanDefinition {
   badge?: string;
 }
 
+// Numbers here MUST match the public pricing table (src/app/page.tsx's PLANS
+// array, in the frontend repo) — those are two separate arrays in two separate
+// repos with no shared source, so a change to one always needs the other
+// updated by hand. ids/tiers ('starter'/'pro'/'enterprise') stay as internal
+// identifiers (referenced elsewhere — billing.service.ts, platform.routes.ts,
+// Workspace.model.ts) even though the user-facing names are now
+// Essencial/Profissional/Business.
 export const PLANS: PlanDefinition[] = [
   {
     id: 'plan-starter',
     tier: 'starter',
-    name: 'Starter',
-    description: 'Para quem está validando o produto',
-    monthlyPriceCents: 9_700,
-    annualPriceCents: 7_760,
+    name: 'Essencial',
+    description: 'Para organizar o primeiro time de atendimento',
+    monthlyPriceCents: 14_900,
+    annualPriceCents: 7_900,
     limits: {
       instances: 1,
-      agents: 2,
+      agents: 3,
       activeAutomations: 3,
       campaignsEnabled: false,
       officialChannelEnabled: false,
+      apiAccessEnabled: false,
       crmMultiPipeline: false,
-      analyticsRetentionDays: 7,
+      analyticsRetentionDays: 30,
       multiWorkspace: false,
     },
     features: [
-      { label: '1 instância WhatsApp', included: true },
-      { label: '2 agentes', included: true },
-      { label: 'Conversas ilimitadas', included: true },
+      { label: '1 número de WhatsApp', included: true },
+      { label: '3 usuários', included: true },
+      { label: 'Conversas ilimitadas (uso justo)', included: true },
       { label: 'Até 3 automações ativas', included: true },
       { label: 'CRM (1 funil)', included: true },
-      { label: 'Analytics (7 dias)', included: true },
+      { label: 'Histórico de 30 dias', included: true },
       { label: 'Suporte por e-mail', included: true },
       { label: 'Campanhas em massa', included: false },
+      { label: 'API e webhooks', included: false },
       { label: 'Multi-workspace', included: false },
     ],
   },
   {
     id: 'plan-pro',
     tier: 'pro',
-    name: 'Pro',
-    description: 'Para times em crescimento que precisam de mais poder',
-    monthlyPriceCents: 29_700,
-    annualPriceCents: 23_760,
+    name: 'Profissional',
+    description: 'Para equipes que querem vender e atender em escala',
+    monthlyPriceCents: 34_900,
+    annualPriceCents: 18_900,
     highlight: true,
-    badge: 'Mais popular',
+    badge: 'Mais escolhido',
     limits: {
-      instances: 5,
+      instances: 3,
       agents: 10,
       activeAutomations: null,
       campaignsEnabled: true,
       officialChannelEnabled: true,
+      apiAccessEnabled: true,
       crmMultiPipeline: true,
-      analyticsRetentionDays: 90,
+      analyticsRetentionDays: 180,
       multiWorkspace: false,
     },
     features: [
-      { label: 'Até 5 instâncias WhatsApp', included: true, highlight: true },
-      { label: 'Até 10 agentes', included: true },
-      { label: 'Conversas ilimitadas', included: true },
-      { label: 'Automações ilimitadas', included: true, highlight: true },
-      { label: 'CRM (funis ilimitados + relatórios)', included: true, highlight: true },
-      { label: 'Campanhas em massa', included: true, highlight: true },
-      { label: 'Analytics (90 dias) + exportação', included: true },
+      { label: '3 números de WhatsApp', included: true, highlight: true },
+      { label: '10 usuários', included: true },
+      { label: 'Conversas ilimitadas (uso justo)', included: true },
+      { label: 'Automações e Flow Builder ilimitados', included: true, highlight: true },
+      { label: 'CRM com múltiplos funis', included: true, highlight: true },
+      { label: 'Campanhas e templates oficiais', included: true, highlight: true },
+      { label: 'API e webhooks', included: true },
+      { label: 'Histórico de 180 dias + relatórios avançados', included: true },
       { label: 'Suporte prioritário', included: true },
       { label: 'Multi-workspace', included: false },
     ],
@@ -105,27 +120,32 @@ export const PLANS: PlanDefinition[] = [
   {
     id: 'plan-enterprise',
     tier: 'enterprise',
-    name: 'Enterprise',
-    description: 'Para grandes operações com volume e compliance',
-    monthlyPriceCents: null,
-    annualPriceCents: null,
+    name: 'Business',
+    description: 'Para operações maduras, com volume e mais controle',
+    monthlyPriceCents: 79_900,
+    annualPriceCents: 44_900,
     limits: {
-      instances: null,
-      agents: null,
+      instances: 10,
+      agents: 30,
       activeAutomations: null,
       campaignsEnabled: true,
       officialChannelEnabled: true,
+      apiAccessEnabled: true,
       crmMultiPipeline: true,
-      analyticsRetentionDays: null,
+      analyticsRetentionDays: 365,
       multiWorkspace: true,
     },
     features: [
-      { label: 'Instâncias ilimitadas', included: true, highlight: true },
-      { label: 'Agentes ilimitados', included: true },
-      { label: 'Multi-workspace', included: true, highlight: true },
-      { label: 'Automações e campanhas sem limite', included: true },
-      { label: 'Analytics com histórico completo', included: true },
-      { label: 'Suporte dedicado + SLA', included: true, highlight: true },
+      { label: '10 números de WhatsApp', included: true, highlight: true },
+      { label: '30 usuários', included: true },
+      { label: 'Conversas ilimitadas (uso justo)', included: true },
+      { label: 'Múltiplos workspaces', included: true, highlight: true },
+      { label: 'API e webhooks com maior capacidade', included: true },
+      { label: 'Gestão avançada de equipes e grupos', included: true },
+      { label: 'Relatórios completos e exportações', included: true },
+      { label: 'Histórico de 12 meses', included: true },
+      { label: 'Implantação assistida', included: true },
+      { label: 'Atendimento prioritário', included: true, highlight: true },
     ],
   },
 ];

@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import ExcelJS from 'exceljs';
 import { resolveDateRange, isoDate } from '../../shared/date-range';
 import { buildReportSummary, findReportConversations, type ReportRow, type CloseReasonRow } from './reports.service';
+import { clampAnalyticsFrom } from '../billing/billing.service';
 
 function requireManager(role: string, reply: import('fastify').FastifyReply): boolean {
   if (!['owner', 'admin'].includes(role)) {
@@ -20,7 +21,8 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
     if (!requireManager(role, reply)) return;
 
     const q = request.query as Record<string, string>;
-    const { from, to } = resolveDateRange(q);
+    const { from: requestedFrom, to } = resolveDateRange(q);
+    const from = await clampAnalyticsFrom(workspaceId, requestedFrom);
     const summary = await buildReportSummary({ workspaceId, from, to, teamGroupId: q.teamGroupId, agentId: q.agentId });
     return reply.send({ data: summary });
   });
@@ -31,7 +33,8 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
     if (!requireManager(role, reply)) return;
 
     const q = request.query as Record<string, string>;
-    const { from, to } = resolveDateRange(q);
+    const { from: requestedFrom, to } = resolveDateRange(q);
+    const from = await clampAnalyticsFrom(workspaceId, requestedFrom);
     const filters = { workspaceId, from, to, teamGroupId: q.teamGroupId, agentId: q.agentId };
 
     const [summary, conversations] = await Promise.all([

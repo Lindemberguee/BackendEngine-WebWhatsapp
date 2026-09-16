@@ -147,6 +147,7 @@ function toPlanResponse(plan: PlanDefinition) {
       agents: plan.limits.agents ?? 'unlimited',
       automations: plan.limits.activeAutomations ?? 'unlimited',
       campaignsEnabled: plan.limits.campaignsEnabled,
+      apiAccessEnabled: plan.limits.apiAccessEnabled,
       crmMultiPipeline: plan.limits.crmMultiPipeline,
       analyticsRetentionDays: plan.limits.analyticsRetentionDays ?? 'unlimited',
       multiWorkspace: plan.limits.multiWorkspace,
@@ -217,6 +218,28 @@ export async function assertOfficialChannelEnabled(workspaceId: string): Promise
   if (!plan.limits.officialChannelEnabled) {
     throw new PlanLimitError(`A API Oficial da Meta não está disponível no plano ${plan.name}. Faça upgrade pro plano Pro pra desbloquear.`);
   }
+}
+
+/** Gates creating a new workspace-level API key or webhook subscription —
+ *  existing ones from before a downgrade keep working, this just stops new ones. */
+export async function assertApiAccessEnabled(workspaceId: string): Promise<void> {
+  const plan = await currentPlan(workspaceId);
+  if (!plan.limits.apiAccessEnabled) {
+    throw new PlanLimitError(`API e webhooks não estão disponíveis no plano ${plan.name}. Faça upgrade pro plano Profissional pra desbloquear.`);
+  }
+}
+
+/** Clamps a requested analytics/report start date to what the workspace's plan
+ *  is allowed to look back on — a request for a wider range than the plan
+ *  covers silently gets the earliest date the plan permits, instead of the
+ *  requested `from` (the retention field existed on the plan config and was
+ *  shown in the billing UI, but nothing actually enforced it). */
+export async function clampAnalyticsFrom(workspaceId: string, from: Date): Promise<Date> {
+  const plan = await currentPlan(workspaceId);
+  const days = plan.limits.analyticsRetentionDays;
+  if (days == null) return from;
+  const earliestAllowed = new Date(Date.now() - days * DAY_MS);
+  return from < earliestAllowed ? earliestAllowed : from;
 }
 
 export async function assertCanActivateAutomation(workspaceId: string): Promise<void> {
