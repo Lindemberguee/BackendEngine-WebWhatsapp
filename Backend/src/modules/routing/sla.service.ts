@@ -44,7 +44,7 @@ export async function applySlaTimers(conversationId: string, workspaceId: string
     if (!conv || conv.firstResponseDueAt || conv.resolutionDueAt) return; // clock already running
 
     const team = teamGroupId && Types.ObjectId.isValid(teamGroupId)
-      ? await TeamGroup.findById(teamGroupId).select('sla businessHours').lean()
+      ? await TeamGroup.findOne({ _id: teamGroupId, workspaceId }).select('sla businessHours').lean()
       : null;
     const workspace = await Workspace.findById(workspaceId).select('settings').lean();
 

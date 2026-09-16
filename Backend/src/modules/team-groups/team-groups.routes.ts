@@ -8,17 +8,41 @@ function wsOid(workspaceId: string) {
   return new Types.ObjectId(workspaceId);
 }
 
+/** Filters a list of candidate user ids down to the ones that are both valid
+ *  ObjectIds AND actually belong to this workspace — the only thing that
+ *  previously stood between this and a cross-tenant reference was
+ *  Types.ObjectId.isValid(), which checks shape, not ownership. */
+async function memberIdsInWorkspace(workspaceId: string, ids: unknown[]): Promise<Types.ObjectId[]> {
+  const candidates = ids.filter((id): id is string => typeof id === 'string' && Types.ObjectId.isValid(id));
+  if (!candidates.length) return [];
+  const users = await User.find({ _id: { $in: candidates }, workspaceId: wsOid(workspaceId) }).select('_id').lean();
+  return users.map((u) => u._id as Types.ObjectId);
+}
+
+async function leadIdInWorkspace(workspaceId: string, id: unknown): Promise<Types.ObjectId | undefined> {
+  if (typeof id !== 'string' || !Types.ObjectId.isValid(id)) return undefined;
+  const exists = await User.exists({ _id: id, workspaceId: wsOid(workspaceId) });
+  return exists ? new Types.ObjectId(id) : undefined;
+}
+
+// workspaceId is passed in explicitly (not read off `g`) and used to scope
+// BOTH member lookups below — previously these queried User by _id alone, so
+// a memberIds/leadId entry pointing at another workspace's user (however it
+// got there — a stale reference, a bug in the write path, a crafted request)
+// would still resolve and leak that user's name/email/avatar/role across
+// tenants. Scoping the read closes the leak even if a bad id somehow ends up
+// stored; assertMembersInWorkspace below stops it from being stored at all.
 async function buildGroup(g: {
   _id: unknown; workspaceId: unknown; name: string; emoji?: string; color?: string; description?: string;
   leadId?: unknown; memberIds?: unknown[]; createdAt: Date; updatedAt: Date;
   routingStrategy?: RoutingStrategy; roundRobinCursor?: number; businessHours?: IBusinessHours; sla?: ITeamGroupSla;
-}) {
+}, workspaceId: string) {
   const memberIds = (g.memberIds ?? []) as Types.ObjectId[];
-  const members = await User.find({ _id: { $in: memberIds } })
+  const members = await User.find({ _id: { $in: memberIds }, workspaceId: wsOid(workspaceId) })
     .select('name email avatarUrl role isActive')
     .lean();
   const lead = g.leadId
-    ? await User.findById(g.leadId).select('name email avatarUrl role').lean()
+    ? await User.findOne({ _id: g.leadId, workspaceId: wsOid(workspaceId) }).select('name email avatarUrl role').lean()
     : null;
 
   return {
@@ -48,7 +72,7 @@ export async function teamGroupsRoutes(fastify: FastifyInstance): Promise<void> 
   fastify.get('/', auth, async (request, reply) => {
     const { workspaceId } = request.user as { workspaceId: string };
     const groups = await TeamGroup.find({ workspaceId: wsOid(workspaceId) }).sort({ name: 1 }).lean();
-    const data = await Promise.all(groups.map(buildGroup));
+    const data = await Promise.all(groups.map((g) => buildGroup(g, workspaceId)));
     return reply.send({ data });
   });
 
@@ -59,7 +83,7 @@ export async function teamGroupsRoutes(fastify: FastifyInstance): Promise<void> 
     if (!Types.ObjectId.isValid(id)) return reply.status(400).send({ error: 'ID inválido' });
     const g = await TeamGroup.findOne({ _id: id, workspaceId: wsOid(workspaceId) }).lean();
     if (!g) return reply.status(404).send({ error: 'Equipe não encontrada' });
-    return reply.send({ data: await buildGroup(g) });
+    return reply.send({ data: await buildGroup(g, workspaceId) });
   });
 
   // POST /api/team-groups
@@ -82,14 +106,14 @@ export async function teamGroupsRoutes(fastify: FastifyInstance): Promise<void> 
       emoji: emoji?.trim() || undefined,
       color: color || undefined,
       description: description?.trim() || undefined,
-      leadId: leadId && Types.ObjectId.isValid(leadId) ? new Types.ObjectId(leadId) : undefined,
-      memberIds: (memberIds ?? []).filter((id) => Types.ObjectId.isValid(id)).map((id) => new Types.ObjectId(id)),
+      leadId: await leadIdInWorkspace(workspaceId, leadId),
+      memberIds: await memberIdsInWorkspace(workspaceId, memberIds ?? []),
       routingStrategy: routingStrategy && ['round_robin', 'least_busy', 'manual'].includes(routingStrategy) ? routingStrategy : undefined,
       businessHours: businessHours ?? undefined,
       sla: sla ?? undefined,
     });
 
-    return reply.status(201).send({ data: await buildGroup(g.toObject()) });
+    return reply.status(201).send({ data: await buildGroup(g.toObject(), workspaceId) });
   });
 
   // PATCH /api/team-groups/:id
@@ -116,9 +140,9 @@ export async function teamGroupsRoutes(fastify: FastifyInstance): Promise<void> 
     if (emoji !== undefined) g.emoji = emoji ?? undefined;
     if (color !== undefined) g.color = color ?? undefined;
     if (description !== undefined) g.description = description?.trim() || undefined;
-    if (leadId !== undefined) g.leadId = leadId && Types.ObjectId.isValid(leadId) ? new Types.ObjectId(leadId) : undefined;
+    if (leadId !== undefined) g.leadId = await leadIdInWorkspace(workspaceId, leadId);
     if (memberIds !== undefined) {
-      g.memberIds = memberIds.filter((mid) => Types.ObjectId.isValid(mid)).map((mid) => new Types.ObjectId(mid));
+      g.memberIds = await memberIdsInWorkspace(workspaceId, memberIds);
     }
     if (routingStrategy !== undefined && ['round_robin', 'least_busy', 'manual'].includes(routingStrategy)) {
       g.routingStrategy = routingStrategy;
@@ -127,7 +151,7 @@ export async function teamGroupsRoutes(fastify: FastifyInstance): Promise<void> 
     if (sla !== undefined) g.sla = sla ?? undefined;
 
     await g.save();
-    return reply.send({ data: await buildGroup(g.toObject()) });
+    return reply.send({ data: await buildGroup(g.toObject(), workspaceId) });
   });
 
   // DELETE /api/team-groups/:id

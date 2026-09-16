@@ -76,8 +76,13 @@ export async function pickAgent(workspaceId: string, teamGroupId?: string | null
   const hours = resolveBusinessHours(team, workspace);
   if (!isWithinBusinessHours(hours)) return null;
 
+  // workspaceId is included even on the team-scoped branch as defense-in-depth
+  // against a stale/bad memberIds entry pointing at another workspace's user —
+  // team.memberIds should already be workspace-validated at write time
+  // (team-groups.routes.ts), but auto-routing a conversation to a stranger in
+  // another tenant is bad enough that this stays belt-and-suspenders.
   const candidateFilter: Record<string, unknown> = team
-    ? { _id: { $in: team.memberIds }, isActive: true, availability: 'available' }
+    ? { _id: { $in: team.memberIds }, workspaceId, isActive: true, availability: 'available' }
     : { workspaceId, isActive: true, availability: 'available', role: { $in: ['agent', 'admin', 'owner'] } };
 
   const candidates = await User.find(candidateFilter).select('_id maxConcurrentChats').lean();

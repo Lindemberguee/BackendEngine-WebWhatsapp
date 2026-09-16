@@ -1,6 +1,6 @@
 import { Types } from 'mongoose';
 import pino from 'pino';
-import { Flow, FlowRun, Conversation, Contact, Rating } from '../db/models';
+import { Flow, FlowRun, Conversation, Contact, Rating, TeamGroup } from '../db/models';
 import type { IFlow, IFlowNode, IFlowRun, UserRole } from '../db/models';
 import { ensureLabel } from '../modules/labels/labels.service';
 import { createLeadFromFlow, moveLeadForContact, assignLeadForContact, updateLeadValueForContact, addLeadNoteForContact, getOpenLeadStageName } from '../modules/crm/crm.service';
@@ -674,7 +674,13 @@ export class FlowRunner {
       // did anything in production; it now reads the same teamGroupId shape.
       if (node.blockType === 'attendance.assign_team' || node.blockType === 'attendance.transfer_queue') {
         const teamGroupId = String(node.config.teamGroupId ?? '');
-        if (Types.ObjectId.isValid(teamGroupId)) {
+        // Flow configs are normally only ever populated from this workspace's own
+        // teams (the block's dropdown lists them via useTeamGroups()), but a
+        // flow.io import isn't re-validated on the way in — check ownership here
+        // too rather than trust whatever id ended up saved on the node.
+        const teamInWorkspace = Types.ObjectId.isValid(teamGroupId)
+          && (await TeamGroup.exists({ _id: teamGroupId, workspaceId: run.workspaceId }));
+        if (teamInWorkspace) {
           await Conversation.updateOne(
             { _id: run.conversationId },
             { $set: { teamGroupId: new Types.ObjectId(teamGroupId) } }

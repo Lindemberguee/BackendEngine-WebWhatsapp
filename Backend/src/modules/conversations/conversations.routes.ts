@@ -1,7 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { Types } from 'mongoose';
 import { parsePagination } from '../../utils/pagination';
-import { Conversation, Message, Contact, Instance, Lead, ScheduledMessage, User, Notification } from '../../db/models';
+import { Conversation, Message, Contact, Instance, Lead, ScheduledMessage, User, Notification, TeamGroup } from '../../db/models';
 import type { SessionManager } from '../../session-manager/SessionManager';
 import type { WebSocketGateway } from '../../ws/gateway';
 import { ensureLabel } from '../labels/labels.service';
@@ -467,9 +467,18 @@ export async function conversationsRoutes(fastify: FastifyInstance, opts: { sess
     const { id } = request.params as { id: string };
     const { teamGroupId } = request.body as { teamGroupId: string | null };
     if (!Types.ObjectId.isValid(id)) return reply.status(404).send({ error: 'Conversa não encontrada' });
-    const update = teamGroupId && Types.ObjectId.isValid(teamGroupId)
-      ? { teamGroupId: new Types.ObjectId(teamGroupId) }
-      : { teamGroupId: null };
+    // Types.ObjectId.isValid() alone only checks shape — without confirming the
+    // team belongs to this workspace, a valid-looking id from another tenant
+    // would tag this conversation with a foreign team (and leak its
+    // name/emoji/color back in the response below via populate).
+    let update: { teamGroupId: Types.ObjectId | null };
+    if (teamGroupId && Types.ObjectId.isValid(teamGroupId)) {
+      const teamInWorkspace = await TeamGroup.exists({ _id: teamGroupId, workspaceId: new Types.ObjectId(workspaceId) });
+      if (!teamInWorkspace) return reply.status(404).send({ error: 'Equipe não encontrada' });
+      update = { teamGroupId: new Types.ObjectId(teamGroupId) };
+    } else {
+      update = { teamGroupId: null };
+    }
     const conv = await Conversation.findOneAndUpdate(
       scopeConversationFilter({ _id: id, workspaceId: new Types.ObjectId(workspaceId) }, { role, sub }),
       { $set: update },

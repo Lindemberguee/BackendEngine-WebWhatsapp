@@ -98,7 +98,11 @@ async function alertBreach(
   // Team lead also gets alerted so an unattended queue doesn't go unnoticed.
   try {
     if (teamGroupId) {
-      const team = await TeamGroup.findById(teamGroupId).select('leadId').lean();
+      // workspaceId filter is defense-in-depth (team-groups.routes.ts now keeps
+      // leadId workspace-valid at write time) — an escalation notification
+      // reaching a user in another tenant would leak this conversation's
+      // content to them, so this stays double-checked.
+      const team = await TeamGroup.findOne({ _id: teamGroupId, workspaceId }).select('leadId').lean();
       if (team?.leadId) recipientIds.add(team.leadId.toString());
     }
     if (!recipientIds.size) {
