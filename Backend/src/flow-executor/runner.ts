@@ -245,41 +245,71 @@ export class FlowRunner {
     const waiting = run.waiting;
     if (!waiting) { run.status = 'completed'; await run.save(); return false; }
 
-    // Rating capture (attendance.close's "Solicitar avaliação") — terminal, not
-    // part of the node graph: parse a 1-5 score out of the reply and file it,
-    // then finish the run either way. Doesn't block the customer on a strict
-    // format — one loose reply and we move on, matching every other
-    // best-effort send in this closing step.
+    const nodes = normalizeNodes(flow);
+    let port = 'out';
+
+    // Rating capture (attendance.rate block) — two stages: the 1-5 score, then
+    // (if the block asks for one) an open comment. Both stages reuse this same
+    // 'rating' wait kind, told apart by _ratingStage in run.variables. Doesn't
+    // hard-block the customer on a strict format for the comment (any text, or
+    // none, is accepted) — only the score is actually validated.
     if (waiting.kind === 'rating') {
-      const match = reply.text.match(/[1-5]/);
-      if (match) {
-        const v = run.variables as Record<string, string | undefined>;
-        try {
-          await Rating.create({
-            workspaceId: run.workspaceId,
-            conversationId: run.conversationId,
-            contactId: v._ratingContactId && Types.ObjectId.isValid(v._ratingContactId) ? v._ratingContactId : undefined,
-            agentId: v._ratingAgentId && Types.ObjectId.isValid(v._ratingAgentId) ? v._ratingAgentId : undefined,
-            teamGroupId: v._ratingTeamGroupId && Types.ObjectId.isValid(v._ratingTeamGroupId) ? v._ratingTeamGroupId : undefined,
-            score: Number(match[0]),
-          });
-          await this.deps.sendMessage(run.jid, { text: 'Muito obrigado pela avaliação! 🙏' } as never).catch(() => {});
-        } catch (err) {
-          // Most likely the unique-per-conversation index (a duplicate reply) — not
-          // worth failing the run over.
-          logger.warn({ err, conversationId: run.conversationId.toString() }, '[flow] failed to save rating');
+      const node = nodeById(nodes, waiting.nodeId);
+      const cfg = (node?.config ?? {}) as { askComment?: boolean; commentPrompt?: string };
+      const v = run.variables as Record<string, string | undefined>;
+
+      if (v._ratingStage !== 'comment') {
+        const match = reply.text.match(/[1-5]/);
+        if (!match) {
+          const attempts = (waiting.invalidAttempts ?? 0) + 1;
+          if (attempts <= 2) {
+            run.waiting = { ...waiting, invalidAttempts: attempts };
+            run.status = 'waiting';
+            await run.save();
+            try { await this.deps.sendMessage(run.jid, { text: 'Não entendi — responda só com um número de 1 a 5, por favor 🙂' } as never); } catch { /* ignore */ }
+            return false;
+          }
+          // Gave up parsing after retries — no clean score to route on. Files as
+          // 'negativa' so an unclear reply surfaces for a human to check instead
+          // of silently vanishing down the happy path.
+          port = 'negativa';
+        } else {
+          const score = Number(match[0]);
+          if (cfg.askComment) {
+            const commentPrompt = String(cfg.commentPrompt ?? '').trim() || 'Quer deixar mais algum comentário? (opcional, pode responder "não")';
+            try { await this.deps.sendMessage(run.jid, { text: commentPrompt } as never); } catch { /* ignore */ }
+            run.variables = { ...run.variables, _ratingStage: 'comment', _ratingScore: String(score) };
+            run.waiting = { nodeId: waiting.nodeId, portIds: waiting.portIds, kind: 'rating' };
+            run.status = 'waiting';
+            await run.save();
+            return false;
+          }
+          await this.saveRating(run, score, undefined);
+          try { await this.deps.sendMessage(run.jid, { text: 'Muito obrigado pela avaliação! 🙏' } as never); } catch { /* ignore */ }
+          port = score >= 4 ? 'positiva' : 'negativa';
         }
       } else {
-        await this.deps.sendMessage(run.jid, { text: 'Obrigado pelo retorno!' } as never).catch(() => {});
+        const score = Number(v._ratingScore ?? '0');
+        const comment = reply.text.trim();
+        const skip = /^(n[aã]o|pular|skip|-)$/i.test(comment);
+        await this.saveRating(run, score, skip || !comment ? undefined : comment);
+        try { await this.deps.sendMessage(run.jid, { text: 'Muito obrigado pela avaliação! 🙏' } as never); } catch { /* ignore */ }
+        port = score >= 4 ? 'positiva' : 'negativa';
       }
+      run.variables = { ...run.variables, _lastText: reply.text };
+      run.lastInboundMessageId = reply.inboundKey?.id;
+      const next = nextNodeId(edges, waiting.nodeId, port);
+      run.currentNodeId = next;
       run.waiting = undefined;
-      run.status = 'completed';
+      run.status = next ? 'running' : 'completed';
       await run.save();
+      if (next) {
+        const contact = await this.loadContact(run);
+        await this.advance(run._id.toString(), contact, reply.inboundKey);
+      }
       return true;
     }
 
-    const nodes = normalizeNodes(flow);
-    let port = 'out';
     if (waiting.kind === 'reply') {
       const node = nodeById(nodes, waiting.nodeId);
       const varName = String((node?.config.variableName as string) ?? '');
@@ -598,9 +628,6 @@ export class FlowRunner {
         if (closeMessage) {
           try { await this.deps.sendMessage(run.jid, { text: closeMessage } as never); } catch { /* ignore */ }
         }
-        // Snapshot who was actually handling this before it's cleared below —
-        // if a rating comes in later, this is the only record of who it's for.
-        const beforeClose = await Conversation.findById(run.conversationId).select('contactId assignedAgentId teamGroupId');
         // Free the ticket on close too (mirrors the resolve endpoint) so a
         // returning contact is re-triaged / eligible for the catch-all again.
         const closeReasonId = String(node.config.closeReasonId ?? '');
@@ -612,23 +639,32 @@ export class FlowRunner {
           }
         );
         await clearSlaTimers(run.conversationId.toString());
-
-        if (node.config.sendRating) {
-          try {
-            await this.deps.sendMessage(run.jid, { text: 'De 1 a 5, como você avalia o atendimento? Responda só com o número 🙂' } as never);
-          } catch { /* ignore */ }
-          run.variables = {
-            ...run.variables,
-            _ratingContactId: beforeClose?.contactId?.toString(),
-            _ratingAgentId: beforeClose?.assignedAgentId?.toString(),
-            _ratingTeamGroupId: beforeClose?.teamGroupId?.toString(),
-          };
-          run.waiting = { nodeId: node.id, portIds: [], kind: 'rating' };
-          run.status = 'waiting';
-          await run.save();
-          return;
-        }
         run.status = 'completed'; await run.save(); return;
+      }
+      // ── Avaliar Atendimento ──────────────────────────────────────────────────
+      // A standalone block (not a toggle buried in attendance.close) so the
+      // designer can place it wherever it makes sense, word the prompt
+      // themselves, and route the two outcomes differently (e.g. a bad score
+      // pinging a supervisor). Put it BEFORE attendance.close if the flow also
+      // closes the ticket — assignedAgentId/teamGroupId are snapshotted here,
+      // and attendance.close nulls the former on its way out.
+      if (node.blockType === 'attendance.rate') {
+        const prompt = interpolate(String(node.config.prompt ?? ''), ctx).trim();
+        if (prompt) {
+          try { await this.deps.sendMessage(run.jid, { text: prompt } as never); } catch { /* ignore */ }
+        }
+        const conv = await Conversation.findById(run.conversationId).select('contactId assignedAgentId teamGroupId');
+        run.variables = {
+          ...run.variables,
+          _ratingStage: 'score',
+          _ratingContactId: conv?.contactId?.toString(),
+          _ratingAgentId: conv?.assignedAgentId?.toString(),
+          _ratingTeamGroupId: conv?.teamGroupId?.toString(),
+        };
+        run.waiting = { nodeId: node.id, portIds: ['positiva', 'negativa'], kind: 'rating' };
+        run.status = 'waiting';
+        await run.save();
+        return;
       }
       if (node.blockType === 'attendance.pause') {
         run.status = 'completed'; await run.save(); return; // hand off to a human
@@ -1003,6 +1039,26 @@ export class FlowRunner {
       const conv = await Conversation.findById(conversationId).select('contactId').lean();
       if (conv?.contactId) await Contact.updateOne({ _id: conv.contactId }, { $set: { [`customFields.${varName}`]: value } });
     } catch (err) { logger.warn({ err, varName }, '[flow] persistVariableToContact failed'); }
+  }
+
+  /** Files a CSAT score (attendance.rate) using the agent/team/contact snapshot
+   *  that block took when it ran — swallows errors (most likely the
+   *  one-rating-per-conversation unique index on a duplicate reply) rather
+   *  than failing the run over a metric that's already best-effort. */
+  private async saveRating(run: IFlowRun, score: number, comment: string | undefined) {
+    const v = run.variables as Record<string, string | undefined>;
+    try {
+      await Rating.create({
+        workspaceId: run.workspaceId,
+        conversationId: run.conversationId,
+        contactId: v._ratingContactId && Types.ObjectId.isValid(v._ratingContactId) ? v._ratingContactId : undefined,
+        agentId: v._ratingAgentId && Types.ObjectId.isValid(v._ratingAgentId) ? v._ratingAgentId : undefined,
+        teamGroupId: v._ratingTeamGroupId && Types.ObjectId.isValid(v._ratingTeamGroupId) ? v._ratingTeamGroupId : undefined,
+        score, comment,
+      });
+    } catch (err) {
+      logger.warn({ err, conversationId: run.conversationId.toString() }, '[flow] failed to save rating');
+    }
   }
 }
 
