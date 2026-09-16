@@ -3,9 +3,16 @@ import type { MediaStorageProvider } from '../../shared/media-storage';
 
 /**
  * A file uploaded from the flow builder (boleto PDF, QR image, block media) and
- * kept in object storage. Referenced by flow block configs via its public URL
- * `${PUBLIC_API_URL}/api/flow-assets/<_id>`, which is fetched unauthenticated by
- * WhatsApp/Baileys — so the `_id` is the only capability token (24 hex chars).
+ * kept in object storage. Referenced by flow block configs via its public URL,
+ * fetched unauthenticated by WhatsApp/Baileys.
+ *
+ * `accessToken` (32 random bytes, hex) is the real capability token for assets
+ * uploaded after this field was added — `${PUBLIC_API_URL}/api/flow-assets/<_id>/<accessToken>`.
+ * It's optional because pre-existing assets never got one: their URL (just the
+ * `_id`) is already baked into saved flow block configs, so backfilling would
+ * either break every flow using them or require rewriting arbitrary JSON across
+ * every Flow document. Those keep working via the bare `_id` route instead —
+ * lower entropy than a real token, but no worse than before this field existed.
  */
 export interface IFlowAsset extends Document {
   workspaceId: Types.ObjectId;
@@ -16,6 +23,7 @@ export interface IFlowAsset extends Document {
   fileName: string;
   size: number;
   sha256: string;
+  accessToken?: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -30,6 +38,7 @@ const FlowAssetSchema = new Schema<IFlowAsset>(
     fileName:    { type: String, required: true },
     size:        { type: Number, required: true },
     sha256:      { type: String, required: true },
+    accessToken: { type: String },
   },
   { timestamps: true }
 );
@@ -45,6 +54,7 @@ FlowAssetSchema.set('toJSON', {
     delete r.__v;
     delete r.key;
     delete r.provider;
+    delete r.accessToken;
     return r;
   },
 });

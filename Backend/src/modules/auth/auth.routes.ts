@@ -7,6 +7,7 @@ import { saveAvatar, avatarUrlFor, AvatarError } from './avatar.service';
 import { notify } from '../notifications/notification.service';
 import type { WebSocketGateway } from '../../ws/gateway';
 import { Avatar } from '../../db/models';
+import { safeEqual } from '../../shared/crypto';
 
 function toMeResponse(user: NonNullable<Awaited<ReturnType<typeof getUserById>>>) {
   return {
@@ -113,8 +114,8 @@ export async function authRoutes(fastify: FastifyInstance, opts: { wsGateway: We
     // (never inline on the User doc) and swap it for a short, cacheable proxy URL before saving.
     if (body.avatarUrl?.startsWith('data:')) {
       try {
-        await saveAvatar(sub, workspaceId, body.avatarUrl);
-        body.avatarUrl = avatarUrlFor(sub);
+        const accessToken = await saveAvatar(sub, workspaceId, body.avatarUrl);
+        body.avatarUrl = avatarUrlFor(sub, accessToken);
       } catch (err) {
         if (err instanceof AvatarError) return reply.status(400).send({ error: err.message });
         throw err;
@@ -126,17 +127,31 @@ export async function authRoutes(fastify: FastifyInstance, opts: { wsGateway: We
     return reply.send(toMeResponse(user));
   });
 
-  // GET /api/auth/avatar/:userId — public (no auth needed, same exposure as a WhatsApp
-  // contact photo): serves the raw image bytes for <img src> everywhere avatarUrl is rendered.
-  // A tight per-route limit (well below the global anonymous bucket) makes scraping/
-  // enumerating ObjectIds impractical without requiring auth on a route <img src> relies on.
-  fastify.get('/avatar/:userId', { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } }, async (request, reply) => {
-    const { userId } = request.params as { userId: string };
+  // GET /api/auth/avatar/:userId/:token — public (no auth needed, same exposure as a
+  // WhatsApp contact photo): serves the raw image bytes for <img src> everywhere
+  // avatarUrl is rendered. `token` is the real capability token (see Avatar.model.ts);
+  // also serves it when the stored avatar predates the token field (accessToken unset).
+  fastify.get('/avatar/:userId/:token', { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } }, async (request, reply) => {
+    const { userId, token } = request.params as { userId: string; token: string };
     // Not .lean() — Mongoose's schema casting turns the stored BSON Binary back into a real
     // Buffer here; a lean query would hand back the raw Binary wrapper instead (see the media
     // rendering fix in messages.routes.ts for the same pitfall with stored Buffers).
     const avatar = await Avatar.findOne({ userId });
     if (!avatar) return reply.status(404).send();
+    if (avatar.accessToken && !safeEqual(token, avatar.accessToken)) return reply.status(404).send();
+    reply.header('Cache-Control', 'public, max-age=31536000, immutable');
+    return reply.type(avatar.mimeType).send(avatar.data);
+  });
+
+  // GET /api/auth/avatar/:userId — legacy, no token: only serves avatars saved before
+  // accessToken existed. Any avatar WITH a token must go through the route above —
+  // otherwise this bare route would make the token pointless for fresh uploads.
+  // Same tight rate limit as the tokened route, for the same reason.
+  fastify.get('/avatar/:userId', { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } }, async (request, reply) => {
+    const { userId } = request.params as { userId: string };
+    const avatar = await Avatar.findOne({ userId });
+    if (!avatar) return reply.status(404).send();
+    if (avatar.accessToken) return reply.status(404).send();
     reply.header('Cache-Control', 'public, max-age=31536000, immutable');
     return reply.type(avatar.mimeType).send(avatar.data);
   });
