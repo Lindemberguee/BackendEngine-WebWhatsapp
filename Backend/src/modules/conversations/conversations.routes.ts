@@ -11,6 +11,7 @@ import { getAutoRouteMode, routeConversation } from '../routing/routing.service'
 import { clearSlaTimers } from '../routing/sla.service';
 import { emitWebhookEvent } from '../webhooks/webhook.service';
 import { scopeConversationFilter } from '../../utils/conversation-visibility';
+import { assertCanCreateConversation } from '../billing/billing.service';
 import { escapeRegex } from '../../shared/string-utils';
 import { requireRole } from '../../utils/require-role';
 import { decryptSecret } from '../../shared/crypto';
@@ -150,6 +151,12 @@ export async function conversationsRoutes(fastify: FastifyInstance, opts: { sess
         ...(activeInstance ? { instanceId: activeInstance._id } : { instanceId: { $exists: false } }),
       });
       if (existing) return reply.status(409).send({ error: 'Conversation already exists for this number' });
+
+      try {
+        await assertCanCreateConversation(workspaceId);
+      } catch (limitErr) {
+        return reply.status(400).send({ error: (limitErr as Error).message });
+      }
 
       // Create conversation linked to the contact (and instance if available)
       const conversation = await Conversation.create({

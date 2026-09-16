@@ -143,7 +143,7 @@ function toPlanResponse(plan: PlanDefinition) {
     annualPrice: plan.annualPriceCents ?? 0,
     limits: {
       instances: plan.limits.instances ?? 'unlimited',
-      conversations: 'unlimited', // no Meta-style per-conversation cost — fair-use, not a hard gate
+      conversations: plan.limits.maxConversationsPerMonth ?? 'unlimited',
       agents: plan.limits.agents ?? 'unlimited',
       automations: plan.limits.activeAutomations ?? 'unlimited',
       campaignsEnabled: plan.limits.campaignsEnabled,
@@ -170,14 +170,14 @@ export async function getUsage(workspaceId: string) {
     Instance.countDocuments({ workspaceId }),
     User.countDocuments({ workspaceId, isActive: true }),
     Flow.countDocuments({ workspaceId, enabled: true }),
-    Conversation.countDocuments({ workspaceId }),
+    Conversation.countDocuments({ workspaceId, createdAt: { $gte: sub.currentPeriodStart } }),
   ]);
 
   return [
     { key: 'instances', label: 'Instâncias WhatsApp', current: instances, limit: plan.limits.instances ?? 'unlimited', unit: 'instâncias', warnAt: 80 },
     { key: 'agents', label: 'Agentes', current: agents, limit: plan.limits.agents ?? 'unlimited', unit: 'agentes', warnAt: 80 },
     { key: 'automations', label: 'Automações ativas', current: activeAutomations, limit: plan.limits.activeAutomations ?? 'unlimited', unit: 'fluxos', warnAt: 80 },
-    { key: 'conversations', label: 'Conversas', current: conversations, limit: 'unlimited' as const, unit: 'conversas' },
+    { key: 'conversations', label: 'Conversas neste período', current: conversations, limit: plan.limits.maxConversationsPerMonth ?? 'unlimited', unit: 'conversas', warnAt: 80 },
   ];
 }
 
@@ -186,6 +186,47 @@ export async function getUsage(workspaceId: string) {
 async function currentPlan(workspaceId: string): Promise<PlanDefinition> {
   const sub = await getOrCreateSubscription(workspaceId);
   return getPlan(sub.planId) ?? getPlanByTier('starter')!;
+}
+
+/** New conversations in the current billing period — createdAt, not
+ *  updatedAt, so an old conversation getting a new message doesn't count
+ *  again (it isn't a *new* conversation). */
+async function conversationsThisPeriod(workspaceId: string): Promise<{ count: number; plan: PlanDefinition }> {
+  const sub = await getOrCreateSubscription(workspaceId);
+  const plan = getPlan(sub.planId) ?? getPlanByTier('starter')!;
+  const count = await Conversation.countDocuments({ workspaceId, createdAt: { $gte: sub.currentPeriodStart } });
+  return { count, plan };
+}
+
+/** Hard gate for deliberate conversation creation (manual "Nova conversa" in
+ *  the UI, campaign sends creating a fresh thread) — these are actions someone
+ *  chose to take, so blocking them at the limit (like every other assertCan*
+ *  here) is fine. Do NOT use this on the inbound-message path — see
+ *  conversationQuotaJustExceeded below for why. */
+export async function assertCanCreateConversation(workspaceId: string): Promise<void> {
+  const { count, plan } = await conversationsThisPeriod(workspaceId);
+  if (plan.limits.maxConversationsPerMonth == null) return;
+  if (count >= plan.limits.maxConversationsPerMonth) {
+    throw new PlanLimitError(`Seu plano ${plan.name} permite até ${plan.limits.maxConversationsPerMonth} conversas novas por mês. Faça upgrade pra continuar.`);
+  }
+}
+
+/** Non-blocking check for the inbound-message path (ingest-inbound.ts): a
+ *  customer messaging in for the first time must never be dropped just
+ *  because the workspace is over its plan's monthly conversation count — that
+ *  would silently lose real customer messages, which is worse than letting
+ *  one workspace run over quota. Call AFTER the conversation upsert, only
+ *  when it was a brand-new conversation; returns non-null exactly once per
+ *  overage (the count equals limit+1 only on the message that crossed it), so
+ *  callers can fire a single "you're over quota" notification instead of one
+ *  per message from then on. */
+export async function conversationQuotaJustExceeded(
+  workspaceId: string
+): Promise<{ plan: PlanDefinition; limit: number } | null> {
+  const { count, plan } = await conversationsThisPeriod(workspaceId);
+  const limit = plan.limits.maxConversationsPerMonth;
+  if (limit == null || count !== limit + 1) return null;
+  return { plan, limit };
 }
 
 export async function assertCanCreateInstance(workspaceId: string): Promise<void> {

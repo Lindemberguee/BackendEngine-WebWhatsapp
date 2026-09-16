@@ -11,6 +11,7 @@ import { handleCampaignReply } from '../modules/campaigns/campaign.service';
 import { getAutoRouteMode, routeConversation } from '../modules/routing/routing.service';
 import { applySlaTimers } from '../modules/routing/sla.service';
 import { emitWebhookEvent } from '../modules/webhooks/webhook.service';
+import { conversationQuotaJustExceeded, notifyPlanChanged } from '../modules/billing/billing.service';
 
 const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' });
 
@@ -108,6 +109,21 @@ export async function ingestInboundMessage(p: NormalizedInbound, deps: IngestDep
   // A fresh upsert has createdAt === updatedAt to the millisecond; used below to
   // gate one-time actions (e.g. CRM auto-lead-creation) to brand-new conversations only.
   const isNewConversation = conversation.createdAt.getTime() === conversation.updatedAt.getTime();
+
+  // A customer's first message is never dropped for being over the plan's
+  // monthly conversation quota — the conversation above is already created by
+  // the time we'd know that. Just tell the owner once, the moment it's crossed.
+  if (isNewConversation) {
+    conversationQuotaJustExceeded(workspaceId).then((overage) => {
+      if (overage) {
+        void notifyPlanChanged(
+          workspaceId, deps.wsGateway,
+          'Limite de conversas do mês atingido',
+          `Seu plano ${overage.plan.name} permite até ${overage.limit} conversas novas por mês, e esse número já foi ultrapassado. Faça upgrade pra evitar interrupções.`
+        );
+      }
+    }).catch(() => {});
+  }
 
   // Opt-in auto-routing: workspaces that want every new inbound conversation routed
   // immediately (rather than waiting for a bot handoff to a human) set autoRoute='on_new'.

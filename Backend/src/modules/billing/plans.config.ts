@@ -10,6 +10,10 @@ export interface PlanLimits {
   /** null = unlimited */
   instances: number | null;
   agents: number | null;
+  /** New conversations (upsert-on-first-message OR manual/campaign creation)
+   *  allowed per current billing period. null = unlimited. See
+   *  assertCanCreateConversation / conversationsThisPeriod. */
+  maxConversationsPerMonth: number | null;
   /** cap on ACTIVE (published) flows, not total flows saved */
   activeAutomations: number | null;
   campaignsEnabled: boolean;
@@ -63,6 +67,7 @@ export const PLANS: PlanDefinition[] = [
     limits: {
       instances: 1,
       agents: 3,
+      maxConversationsPerMonth: 1_000,
       activeAutomations: 3,
       campaignsEnabled: false,
       officialChannelEnabled: false,
@@ -74,7 +79,7 @@ export const PLANS: PlanDefinition[] = [
     features: [
       { label: '1 número de WhatsApp', included: true },
       { label: '3 usuários', included: true },
-      { label: 'Conversas ilimitadas (uso justo)', included: true },
+      { label: '1.000 conversas por mês', included: true },
       { label: 'Até 3 automações ativas', included: true },
       { label: 'CRM (1 funil)', included: true },
       { label: 'Histórico de 30 dias', included: true },
@@ -96,6 +101,7 @@ export const PLANS: PlanDefinition[] = [
     limits: {
       instances: 3,
       agents: 10,
+      maxConversationsPerMonth: 5_000,
       activeAutomations: null,
       campaignsEnabled: true,
       officialChannelEnabled: true,
@@ -107,7 +113,7 @@ export const PLANS: PlanDefinition[] = [
     features: [
       { label: '3 números de WhatsApp', included: true, highlight: true },
       { label: '10 usuários', included: true },
-      { label: 'Conversas ilimitadas (uso justo)', included: true },
+      { label: '5.000 conversas por mês', included: true },
       { label: 'Automações e Flow Builder ilimitados', included: true, highlight: true },
       { label: 'CRM com múltiplos funis', included: true, highlight: true },
       { label: 'Campanhas e templates oficiais', included: true, highlight: true },
@@ -127,6 +133,7 @@ export const PLANS: PlanDefinition[] = [
     limits: {
       instances: 10,
       agents: 30,
+      maxConversationsPerMonth: 20_000,
       activeAutomations: null,
       campaignsEnabled: true,
       officialChannelEnabled: true,
@@ -138,7 +145,7 @@ export const PLANS: PlanDefinition[] = [
     features: [
       { label: '10 números de WhatsApp', included: true, highlight: true },
       { label: '30 usuários', included: true },
-      { label: 'Conversas ilimitadas (uso justo)', included: true },
+      { label: '20.000 conversas por mês', included: true },
       { label: 'Múltiplos workspaces', included: true, highlight: true },
       { label: 'API e webhooks com maior capacidade', included: true },
       { label: 'Gestão avançada de equipes e grupos', included: true },

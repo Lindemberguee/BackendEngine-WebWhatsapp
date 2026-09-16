@@ -11,6 +11,7 @@ import { toBaileys } from '../../channels/baileys/to-baileys';
 import type { OutboundMessage } from '../../messaging/outbound-types';
 import { ensureDefaultPipeline, nextOrder, logLeadActivity } from '../crm/crm.service';
 import { findRateForSend } from './rate-lookup';
+import { conversationQuotaJustExceeded, notifyPlanChanged } from '../billing/billing.service';
 import pino from 'pino';
 
 const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' });
@@ -303,10 +304,23 @@ export async function sendNextRecipient(
     // Find-or-create the conversation so this shows up like any normal outbound message.
     let conversation = await Conversation.findOne({ workspaceId: campaign.workspaceId, instanceId: chosen._id, jid: recipient.jid });
     if (!conversation) {
+      // The WhatsApp send above already happened and can't be undone, so this can't
+      // hard-block on the plan's conversation quota the way a manually-created
+      // conversation does (blocking here would leave a delivered message with no
+      // conversation record to ever show it in) — same reasoning as the inbound
+      // path in ingest-inbound.ts. Just notify the owner once if this crossed it.
       conversation = await Conversation.create({
         workspaceId: campaign.workspaceId, name: contact.name, phone: contact.phone, jid: recipient.jid,
         status: 'open', isGroup: false, unreadCount: 0, contactId: contact._id, instanceId: chosen._id,
       });
+      const overage = await conversationQuotaJustExceeded(campaign.workspaceId.toString());
+      if (overage) {
+        void notifyPlanChanged(
+          campaign.workspaceId.toString(), gateway,
+          'Limite de conversas do mês atingido',
+          `Seu plano ${overage.plan.name} permite até ${overage.limit} conversas novas por mês, e esse número já foi ultrapassado. Faça upgrade pra evitar interrupções.`
+        );
+      }
     }
     const now = new Date();
     const { content, preview, docType } = await toStoredContent(outbound, campaign.message.blockType, campaign.workspaceId, chosen._id);
