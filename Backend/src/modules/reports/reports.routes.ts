@@ -60,6 +60,8 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
       { metric: 'Atendimento — Bot', value: summary.attendanceMode.bot },
       { metric: 'Atendimento — Humano', value: summary.attendanceMode.human },
       { metric: 'Atendimento — Ocioso', value: summary.attendanceMode.idle },
+      { metric: 'Nota média de satisfação (CSAT)', value: summary.csat.average ?? '—' },
+      { metric: 'Avaliações recebidas', value: summary.csat.count },
     ]);
     summarySheet.getRow(1).font = { bold: true };
 
@@ -89,6 +91,18 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
     }
     addBreakdownSheet('Por Equipe', 'Equipe', summary.byTeam);
     addBreakdownSheet('Por Atendente', 'Atendente', summary.byAgent);
+
+    // ── Satisfação (CSAT) ─────────────────────────────────────────────────────
+    const csatSheet = workbook.addWorksheet('Satisfação');
+    csatSheet.columns = [{ header: 'Nota', key: 'label', width: 24 }, { header: 'Avaliações', key: 'count', width: 14 }];
+    csatSheet.addRows(summary.csat.distribution.map((d) => ({ label: `${d.score} estrela${d.score > 1 ? 's' : ''}`, count: d.count })));
+    csatSheet.addRow({});
+    csatSheet.addRow({ label: 'Por atendente', count: '' }).font = { bold: true };
+    csatSheet.addRows(summary.csat.byAgent.map((a) => ({ label: a.name, count: `${a.average} (${a.count} avaliações)` })));
+    csatSheet.addRow({});
+    csatSheet.addRow({ label: 'Por equipe', count: '' }).font = { bold: true };
+    csatSheet.addRows(summary.csat.byTeam.map((t) => ({ label: t.name, count: `${t.average} (${t.count} avaliações)` })));
+    csatSheet.getRow(1).font = { bold: true };
 
     // ── Motivos de Encerramento ───────────────────────────────────────────────
     const reasonSheet = workbook.addWorksheet('Motivos de Encerramento');

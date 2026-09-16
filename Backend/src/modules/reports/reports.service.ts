@@ -1,5 +1,5 @@
 import { Types } from 'mongoose';
-import { Conversation, TeamGroup, User, CloseReason } from '../../db/models';
+import { Conversation, TeamGroup, User, CloseReason, Rating } from '../../db/models';
 import { addDays, daysBetween, emptyDailyBuckets } from '../../shared/date-range';
 
 export interface ReportFilters {
@@ -31,6 +31,23 @@ export interface CloseReasonRow {
   byAgent: { id: string | null; name: string; count: number }[];
 }
 
+export interface CsatRow {
+  id: string | null;
+  name: string;
+  average: number;
+  count: number;
+}
+
+export interface CsatSummary {
+  /** null when nobody's rated anything in range yet — distinct from 0, which
+   *  would misleadingly read as "everyone gave 0 stars". */
+  average: number | null;
+  count: number;
+  distribution: { score: number; count: number }[];
+  byAgent: CsatRow[];
+  byTeam: CsatRow[];
+}
+
 export interface ReportSummary {
   period: { from: string; to: string };
   overview: {
@@ -59,6 +76,7 @@ export interface ReportSummary {
   byTeam: ReportRow[];
   byAgent: ReportRow[];
   closeReasons: CloseReasonRow[];
+  csat: CsatSummary;
 }
 
 const NONE_KEY = 'none';
@@ -158,6 +176,12 @@ export async function buildReportSummary(filters: ReportFilters): Promise<Report
   // a workspace-wide live figure.
   const openMatch = { ...baseFilter, status: 'open' };
 
+  // Ratings are their own collection (see Rating.model.ts) — same team/agent
+  // filters, but keyed by Rating's own fields, not Conversation's.
+  const ratingMatch: Record<string, unknown> = { workspaceId: wsOid, createdAt: { $gte: from, $lte: to } };
+  if (teamGroupId && Types.ObjectId.isValid(teamGroupId)) ratingMatch.teamGroupId = new Types.ObjectId(teamGroupId);
+  if (agentId && Types.ObjectId.isValid(agentId)) ratingMatch.agentId = new Types.ObjectId(agentId);
+
   // Previous period of equal length, for the delta arrows on the KPI cards.
   const span = Math.max(1, daysBetween(from, to));
   const prevFrom = addDays(from, -span);
@@ -171,6 +195,7 @@ export async function buildReportSummary(filters: ReportFilters): Promise<Report
     prevOverview,
     closeReasonByTeamRows, closeReasonByAgentRows,
     teamGroups, users, closeReasonsDocs,
+    csatOverallRows, csatByScoreRows, csatByAgentRows, csatByTeamRows,
   ] = await Promise.all([
     countByGroup(createdMatch, 'teamGroupId'),
     countByGroup(resolvedMatch, 'teamGroupId'),
@@ -230,6 +255,23 @@ export async function buildReportSummary(filters: ReportFilters): Promise<Report
     TeamGroup.find({ workspaceId: wsOid }).select('name emoji color').lean(),
     User.find({ workspaceId: wsOid }).select('name').lean(),
     CloseReason.find({ workspaceId: wsOid }).select('label color').lean(),
+
+    Rating.aggregate<{ _id: null; average: number; count: number }>([
+      { $match: ratingMatch },
+      { $group: { _id: null, average: { $avg: '$score' }, count: { $sum: 1 } } },
+    ]),
+    Rating.aggregate<{ _id: number; count: number }>([
+      { $match: ratingMatch },
+      { $group: { _id: '$score', count: { $sum: 1 } } },
+    ]),
+    Rating.aggregate<{ _id: Types.ObjectId | null; average: number; count: number }>([
+      { $match: ratingMatch },
+      { $group: { _id: '$agentId', average: { $avg: '$score' }, count: { $sum: 1 } } },
+    ]),
+    Rating.aggregate<{ _id: Types.ObjectId | null; average: number; count: number }>([
+      { $match: ratingMatch },
+      { $group: { _id: '$teamGroupId', average: { $avg: '$score' }, count: { $sum: 1 } } },
+    ]),
   ]);
 
   const teamMap = new Map(teamGroups.map((t) => [t._id.toString(), { name: t.name, emoji: t.emoji ?? null, color: t.color ?? null }]));
@@ -337,6 +379,36 @@ export async function buildReportSummary(filters: ReportFilters): Promise<Report
   const resolutionRate = pct(resolvedInRange, totalCreated);
   const prevResolutionRate = pct(prevOverview.resolvedInRange, prevOverview.totalCreated);
 
+  const csatOverall = csatOverallRows[0];
+  const distributionCounts = new Map(csatByScoreRows.map((r) => [r._id, r.count]));
+  const csat: CsatSummary = {
+    average: csatOverall ? Math.round(csatOverall.average * 10) / 10 : null,
+    count: csatOverall?.count ?? 0,
+    distribution: [1, 2, 3, 4, 5].map((score) => ({ score, count: distributionCounts.get(score) ?? 0 })),
+    byAgent: csatByAgentRows
+      .map((r) => {
+        const key = r._id ? r._id.toString() : NONE_KEY;
+        return {
+          id: key === NONE_KEY ? null : key,
+          name: key === NONE_KEY ? 'Não atribuído' : (userMap.get(key) ?? 'Atendente removido'),
+          average: Math.round(r.average * 10) / 10,
+          count: r.count,
+        };
+      })
+      .sort((a, b) => b.count - a.count),
+    byTeam: csatByTeamRows
+      .map((r) => {
+        const key = r._id ? r._id.toString() : NONE_KEY;
+        return {
+          id: key === NONE_KEY ? null : key,
+          name: key === NONE_KEY ? 'Sem equipe' : (teamMap.get(key)?.name ?? 'Equipe removida'),
+          average: Math.round(r.average * 10) / 10,
+          count: r.count,
+        };
+      })
+      .sort((a, b) => b.count - a.count),
+  };
+
   return {
     period: { from: from.toISOString(), to: to.toISOString() },
     overview: {
@@ -356,6 +428,7 @@ export async function buildReportSummary(filters: ReportFilters): Promise<Report
     byTeam,
     byAgent,
     closeReasons,
+    csat,
   };
 }
 

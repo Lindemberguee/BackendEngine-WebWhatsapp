@@ -1,6 +1,6 @@
 import { Types } from 'mongoose';
 import pino from 'pino';
-import { Flow, FlowRun, Conversation, Contact } from '../db/models';
+import { Flow, FlowRun, Conversation, Contact, Rating } from '../db/models';
 import type { IFlow, IFlowNode, IFlowRun, UserRole } from '../db/models';
 import { ensureLabel } from '../modules/labels/labels.service';
 import { createLeadFromFlow, moveLeadForContact, assignLeadForContact, updateLeadValueForContact, addLeadNoteForContact, getOpenLeadStageName } from '../modules/crm/crm.service';
@@ -244,6 +244,39 @@ export class FlowRunner {
     const edges = normalizeEdges(flow);
     const waiting = run.waiting;
     if (!waiting) { run.status = 'completed'; await run.save(); return false; }
+
+    // Rating capture (attendance.close's "Solicitar avaliação") — terminal, not
+    // part of the node graph: parse a 1-5 score out of the reply and file it,
+    // then finish the run either way. Doesn't block the customer on a strict
+    // format — one loose reply and we move on, matching every other
+    // best-effort send in this closing step.
+    if (waiting.kind === 'rating') {
+      const match = reply.text.match(/[1-5]/);
+      if (match) {
+        const v = run.variables as Record<string, string | undefined>;
+        try {
+          await Rating.create({
+            workspaceId: run.workspaceId,
+            conversationId: run.conversationId,
+            contactId: v._ratingContactId && Types.ObjectId.isValid(v._ratingContactId) ? v._ratingContactId : undefined,
+            agentId: v._ratingAgentId && Types.ObjectId.isValid(v._ratingAgentId) ? v._ratingAgentId : undefined,
+            teamGroupId: v._ratingTeamGroupId && Types.ObjectId.isValid(v._ratingTeamGroupId) ? v._ratingTeamGroupId : undefined,
+            score: Number(match[0]),
+          });
+          await this.deps.sendMessage(run.jid, { text: 'Muito obrigado pela avaliação! 🙏' } as never).catch(() => {});
+        } catch (err) {
+          // Most likely the unique-per-conversation index (a duplicate reply) — not
+          // worth failing the run over.
+          logger.warn({ err, conversationId: run.conversationId.toString() }, '[flow] failed to save rating');
+        }
+      } else {
+        await this.deps.sendMessage(run.jid, { text: 'Obrigado pelo retorno!' } as never).catch(() => {});
+      }
+      run.waiting = undefined;
+      run.status = 'completed';
+      await run.save();
+      return true;
+    }
 
     const nodes = normalizeNodes(flow);
     let port = 'out';
@@ -565,6 +598,9 @@ export class FlowRunner {
         if (closeMessage) {
           try { await this.deps.sendMessage(run.jid, { text: closeMessage } as never); } catch { /* ignore */ }
         }
+        // Snapshot who was actually handling this before it's cleared below —
+        // if a rating comes in later, this is the only record of who it's for.
+        const beforeClose = await Conversation.findById(run.conversationId).select('contactId assignedAgentId teamGroupId');
         // Free the ticket on close too (mirrors the resolve endpoint) so a
         // returning contact is re-triaged / eligible for the catch-all again.
         const closeReasonId = String(node.config.closeReasonId ?? '');
@@ -576,6 +612,22 @@ export class FlowRunner {
           }
         );
         await clearSlaTimers(run.conversationId.toString());
+
+        if (node.config.sendRating) {
+          try {
+            await this.deps.sendMessage(run.jid, { text: 'De 1 a 5, como você avalia o atendimento? Responda só com o número 🙂' } as never);
+          } catch { /* ignore */ }
+          run.variables = {
+            ...run.variables,
+            _ratingContactId: beforeClose?.contactId?.toString(),
+            _ratingAgentId: beforeClose?.assignedAgentId?.toString(),
+            _ratingTeamGroupId: beforeClose?.teamGroupId?.toString(),
+          };
+          run.waiting = { nodeId: node.id, portIds: [], kind: 'rating' };
+          run.status = 'waiting';
+          await run.save();
+          return;
+        }
         run.status = 'completed'; await run.save(); return;
       }
       if (node.blockType === 'attendance.pause') {

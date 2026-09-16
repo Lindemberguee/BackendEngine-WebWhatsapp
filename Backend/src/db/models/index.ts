@@ -30,6 +30,7 @@ export { WhatsAppTemplate } from './WhatsAppTemplate.model';
 export { MetaWebhookEvent } from './MetaWebhookEvent.model';
 export { PricingRate } from './PricingRate.model';
 export { FlowAsset } from './FlowAsset.model';
+export { Rating } from './Rating.model';
 
 export type { IFlowAsset } from './FlowAsset.model';
 export type { IWorkspace } from './Workspace.model';
@@ -63,3 +64,4 @@ export type { IScheduledMessage, ScheduledMessageStatus } from './ScheduledMessa
 export type { IWhatsAppTemplate, TemplateStatus } from './WhatsAppTemplate.model';
 export type { IMetaWebhookEvent, MetaWebhookEventStatus } from './MetaWebhookEvent.model';
 export type { IPricingRate, PricingCategory } from './PricingRate.model';
+export type { IRating } from './Rating.model';

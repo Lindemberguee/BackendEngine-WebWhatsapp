@@ -19,7 +19,7 @@ export interface IFlowRun extends Document {
   waiting?: {
     nodeId: string;
     portIds: string[];
-    kind: 'reply' | 'button' | 'list' | 'poll';
+    kind: 'reply' | 'button' | 'list' | 'poll' | 'rating';
     /** Absolute timestamp after which the 'timeout' port fires (wait_response only). */
     waitingUntil?: Date;
     /** How many non-matching replies have been received in a row at this node —
@@ -64,7 +64,7 @@ const FlowRunSchema = new Schema<IFlowRun>(
     waiting: {
       nodeId: { type: String },
       portIds: [{ type: String }],
-      kind: { type: String, enum: ['reply', 'button', 'list', 'poll'] },
+      kind: { type: String, enum: ['reply', 'button', 'list', 'poll', 'rating'] },
       waitingUntil: { type: Date },
     },
     resumeAt: { type: Date },
