@@ -1,8 +1,15 @@
 import { z } from 'zod';
 import type { ContactStatus, ContactSource } from '../../db/models';
 
+// PhoneInput sends E.164 values (for example +5511999999999), while imports
+// often contain punctuation. Normalize at the API boundary so both paths use
+// the same canonical digits-only phone/JID representation.
+const phoneSchema = z.string().min(1).transform((value) => value.replace(/\D/g, '')).refine((value) => /^\d+$/.test(value), {
+  message: 'Telefone inválido',
+});
+
 export const CreateContactSchema = z.object({
-  phone: z.string().min(1).regex(/^\d+$/),
+  phone: phoneSchema,
   name: z.string().min(1).max(100),
   email: z.string().email().optional(),
   company: z.string().max(100).optional(),
@@ -16,6 +23,7 @@ export const CreateContactSchema = z.object({
 });
 
 export const UpdateContactSchema = z.object({
+  phone: phoneSchema.optional(),
   name: z.string().min(1).max(100).optional(),
   email: z.string().email().optional(),
   company: z.string().max(100).optional(),

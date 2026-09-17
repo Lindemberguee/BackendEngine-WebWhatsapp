@@ -264,10 +264,26 @@ export async function contactsRoutes(fastify: FastifyInstance): Promise<void> {
 
       const input = UpdateContactSchema.parse(request.body);
 
+      const contactFilter = { _id: new Types.ObjectId(id), workspaceId: new Types.ObjectId(workspaceId) };
+      const current = await Contact.findOne(contactFilter);
+      if (!current) return reply.status(404).send({ error: "Contact not found" });
+
+      const normalizedPhone = input.phone?.replace(/\D/g, '');
+      const nextJid = normalizedPhone ? `${normalizedPhone}@s.whatsapp.net` : current.jid;
+      if (normalizedPhone && normalizedPhone !== current.phone) {
+        const duplicate = await Contact.findOne({
+          workspaceId: new Types.ObjectId(workspaceId),
+          _id: { $ne: current._id },
+          $or: [{ phone: normalizedPhone }, { jid: nextJid }],
+        }).select('_id').lean();
+        if (duplicate) return reply.status(409).send({ error: "Contact already exists" });
+      }
+
       const contact = await Contact.findOneAndUpdate(
-        { _id: new Types.ObjectId(id), workspaceId: new Types.ObjectId(workspaceId) },
+        contactFilter,
         {
           $set: {
+            ...(normalizedPhone && { phone: normalizedPhone, jid: nextJid }),
             ...(input.name && { name: input.name }),
             ...(input.email !== undefined && { email: input.email }),
             ...(input.company !== undefined && { company: input.company }),
@@ -290,9 +306,16 @@ export async function contactsRoutes(fastify: FastifyInstance): Promise<void> {
 
       if (!contact) return reply.status(404).send({ error: "Contact not found" });
 
+      if (normalizedPhone && normalizedPhone !== current.phone) {
+        await Conversation.updateMany(
+          { workspaceId: new Types.ObjectId(workspaceId), jid: current.jid, isGroup: false },
+          { $set: { jid: nextJid, phone: normalizedPhone } }
+        );
+      }
+
       if (input.name) {
         await Conversation.updateMany(
-          { workspaceId: new Types.ObjectId(workspaceId), jid: contact.jid, isGroup: false },
+          { workspaceId: new Types.ObjectId(workspaceId), jid: nextJid, isGroup: false },
           { $set: { name: input.name } }
         );
       }
@@ -322,6 +345,21 @@ export async function contactsRoutes(fastify: FastifyInstance): Promise<void> {
       });
 
       if (!contact) return reply.status(404).send({ error: "Contact not found" });
+
+      // Keep related records valid after removing the contact. Leaving a stale
+      // contactId makes conversation/customer panels point at a non-existent
+      // record and prevents later re-linking by JID.
+      await Promise.all([
+        Conversation.updateMany(
+          { workspaceId: new Types.ObjectId(workspaceId), contactId: contact._id },
+          { $unset: { contactId: 1 } }
+        ),
+        Lead.updateMany(
+          { workspaceId: new Types.ObjectId(workspaceId), contactId: contact._id },
+          { $unset: { contactId: 1 } }
+        ),
+      ]);
+      void logContactAudit(workspaceId, (request.user as { sub?: string }).sub, id, 'contact.deleted', `Contato ${contact.name} excluído`);
 
       reply.send({ success: true });
     } catch (err) {
@@ -434,17 +472,18 @@ export async function contactsRoutes(fastify: FastifyInstance): Promise<void> {
       const { workspaceId } = request.user as { workspaceId: string };
       const input = BulkTagSchema.parse(request.body);
       const contactIds = input.contactIds.map((id) => new Types.ObjectId(id));
+      const normalizedTag = input.tag.trim();
 
       if (input.action === "add") {
-        await ensureLabel(workspaceId, input.tag.trim());
+        await ensureLabel(workspaceId, normalizedTag);
         await Contact.updateMany(
           { _id: { $in: contactIds }, workspaceId: new Types.ObjectId(workspaceId) },
-          { $addToSet: { tags: input.tag } }
+          { $addToSet: { tags: normalizedTag } }
         );
       } else {
         await Contact.updateMany(
           { _id: { $in: contactIds }, workspaceId: new Types.ObjectId(workspaceId) },
-          { $pull: { tags: input.tag } }
+          { $pull: { tags: normalizedTag } }
         );
       }
 
