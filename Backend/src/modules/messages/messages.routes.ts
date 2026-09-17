@@ -601,7 +601,11 @@ export async function messagesRoutes(fastify: FastifyInstance, opts: { sessionMa
       } catch { /* ignore if WA delete fails */ }
     }
 
-    await Message.updateOne({ _id: messageId }, { status: 'deleted' });
+    await Message.updateOne({ _id: messageId, conversationId }, { status: 'deleted' });
+    opts.wsGateway.broadcastToConversationVisibility(workspaceId, conv.assignedAgentId?.toString(), 'message:deleted', {
+      conversationId,
+      messageId,
+    });
     return reply.send({ ok: true });
   });
 
