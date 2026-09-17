@@ -48,6 +48,10 @@ export class BaileysSession implements IChannelSession {
   private reconnectAttempts = 0;
   private destroyed = false;
   private connected = false;
+  private connecting?: Promise<void>;
+  private generation = 0;
+  private pairingRequested = false;
+  private flushAuthWrites: () => Promise<void> = async () => {};
   private workspaceId!: string;
   private groupSubjectCache = new Map<string, { subject: string; ts: number }>();
 
@@ -60,7 +64,18 @@ export class BaileysSession implements IChannelSession {
     private readonly onLoggedOut?: () => void
   ) {}
 
-  async connect(): Promise<void> {
+  connect(): Promise<void> {
+    if (this.destroyed) return Promise.reject(new Error('Sessão encerrada'));
+    if (this.connecting) return this.connecting;
+    const pending = this.connectSocket().finally(() => {
+      if (this.connecting === pending) this.connecting = undefined;
+    });
+    this.connecting = pending;
+    return pending;
+  }
+
+  private async connectSocket(): Promise<void> {
+    const generation = ++this.generation;
     // Guard against overlapping connect() calls — a pending reconnect timer
     // firing while another connect() is already in flight (or a manual restart
     // racing a reconnect) would otherwise leave two live sockets both wired to
@@ -84,7 +99,10 @@ export class BaileysSession implements IChannelSession {
     await Instance.findByIdAndUpdate(this.instanceId, { $set: { status: 'connecting' }, $unset: { errorMessage: 1 } });
     this.wsGateway.broadcastInstanceStatus(this.workspaceId, this.instanceId, 'connecting');
 
-    const { state, saveCreds } = await useMongoAuthState(this.instanceId);
+    await this.flushAuthWrites();
+    const { state, saveCreds, flushWrites } = await useMongoAuthState(this.instanceId, () => !this.destroyed && this.generation === generation);
+    this.flushAuthWrites = flushWrites;
+    if (this.destroyed || this.generation !== generation) return;
 
     this.sock = makeWASocket({
       auth: {
@@ -94,31 +112,36 @@ export class BaileysSession implements IChannelSession {
       printQRInTerminal: false,
       logger: logger.child({ instanceId: this.instanceId }) as unknown as Parameters<typeof makeWASocket>[0]['logger'],
       defaultQueryTimeoutMs: 60_000,
+      qrTimeout: 45_000,
       browser: ['WebWhatsapp', 'Chrome', '127.0.0'],
     });
 
     // ── Connection state ────────────────────────────────────────────────────
     this.sock.ev.on('connection.update', async (update) => {
       try {
+      if (this.destroyed || this.generation !== generation) return;
       const { connection, lastDisconnect, qr } = update;
 
-      if (qr) {
+      if (qr && !this.pairingRequested) {
+        const qrExpiresAt = new Date(Date.now() + 45_000);
         const QRCode = await import('qrcode');
         const qrBase64 = await QRCode.toDataURL(qr);
-        await Instance.findByIdAndUpdate(this.instanceId, { status: 'qr_pending', qrCode: qrBase64 });
-        this.wsGateway.broadcastInstanceStatus(this.workspaceId, this.instanceId, 'qr_pending', { qrCode: qrBase64 });
+        if (this.destroyed || this.generation !== generation) return;
+        await Instance.findByIdAndUpdate(this.instanceId, { $set: { status: 'qr_pending', qrCode: qrBase64, qrExpiresAt }, $unset: { pairingCode: 1 } });
+        this.wsGateway.broadcastInstanceStatus(this.workspaceId, this.instanceId, 'qr_pending', { qrCode: qrBase64, qrExpiresAt: qrExpiresAt.toISOString() });
       }
 
       if (connection === 'open') {
         this.reconnectAttempts = 0;
         this.connected = true;
+        this.pairingRequested = false;
         const phone = this.sock?.user?.id?.split(':')[0] ?? undefined;
         // Same undefined-doesn't-clear pitfall — the old QR/pairing code and any
         // stale error message never actually left the document, and kept being
         // returned by GET /api/instances for an instance that's now connected.
         await Instance.findByIdAndUpdate(this.instanceId, {
           $set: { status: 'connected', lastConnectedAt: new Date(), phone },
-          $unset: { qrCode: 1, pairingCode: 1, errorMessage: 1 },
+          $unset: { qrCode: 1, qrExpiresAt: 1, pairingCode: 1, errorMessage: 1 },
         });
         this.wsGateway.broadcastInstanceStatus(this.workspaceId, this.instanceId, 'connected', { phone });
         logger.info({ instanceId: this.instanceId, phone }, 'Instance connected');
@@ -146,13 +169,18 @@ export class BaileysSession implements IChannelSession {
         const isBanned = statusCode === DisconnectReason.forbidden;
 
         const status = loggedOut ? 'disconnected' : isBanned ? 'banned' : 'error';
+        if (loggedOut || terminalCode) {
+          this.destroyed = true;
+          await this.flushAuthWrites();
+        }
+        this.pairingRequested = false;
         // Same undefined-doesn't-clear pitfall as above: on a clean logout the old
         // errorMessage from a previous failed attempt needs an actual $unset, or it
         // stays displayed even though the instance is now just cleanly disconnected.
         await Instance.findByIdAndUpdate(this.instanceId, loggedOut
-          ? { $set: { status, lastDisconnectedAt: new Date() }, $unset: { errorMessage: 1 } }
+          ? { $set: { status, lastDisconnectedAt: new Date() }, $unset: { errorMessage: 1, authCreds: 1, authKeys: 1, qrCode: 1, qrExpiresAt: 1, pairingCode: 1 } }
           : { $set: { status, lastDisconnectedAt: new Date(), errorMessage: String(lastDisconnect?.error ?? 'Unknown error') } });
-        this.wsGateway.broadcastInstanceStatus(this.workspaceId, this.instanceId, status);
+        this.wsGateway.broadcastInstanceStatus(this.workspaceId, this.instanceId, status, { errorMessage: loggedOut ? undefined : String(lastDisconnect?.error ?? 'Falha na conexão') });
         notifyWorkspaceOwner(this.wsGateway, this.workspaceId, {
           type: 'instance.disconnected', title: 'WhatsApp desconectado',
           message: loggedOut
@@ -196,7 +224,7 @@ export class BaileysSession implements IChannelSession {
     });
 
     // ── Credentials ────────────────────────────────────────────────────────
-    this.sock.ev.on('creds.update', saveCreds);
+    this.sock.ev.on('creds.update', () => { void saveCreds().catch((err) => logger.error({ err, instanceId: this.instanceId }, 'Falha ao persistir credenciais')); });
 
     // ── Messages ───────────────────────────────────────────────────────────
     this.sock.ev.on('messages.upsert', async ({ messages, type }) => {
@@ -564,12 +592,15 @@ export class BaileysSession implements IChannelSession {
   }
 
   async requestPairingCode(phone: string): Promise<string> {
-    if (!this.sock) throw new Error('Instance not connected');
-    const code = await this.sock.requestPairingCode(phone);
-    await Instance.findByIdAndUpdate(this.instanceId, {
-      status: 'pairing_pending',
-      pairingCode: code,
-    });
+    if (!this.sock || this.destroyed) throw new Error('Sessão indisponível. Reconecte a instância.');
+    this.pairingRequested = true;
+    let code: string;
+    try { code = await this.sock.requestPairingCode(phone); }
+    catch (error) { this.pairingRequested = false; throw error; }
+    if (this.destroyed) throw new Error('Sessão encerrada durante o pareamento');
+    await Instance.findByIdAndUpdate(this.instanceId, { $set: {
+      status: 'pairing_pending', pairingCode: code,
+    }, $unset: { qrCode: 1, qrExpiresAt: 1 } });
     this.wsGateway.broadcastInstanceStatus(this.workspaceId, this.instanceId, 'pairing_pending', { pairingCode: code });
     return code;
   }
@@ -578,6 +609,7 @@ export class BaileysSession implements IChannelSession {
     this.destroyed = true;
     try { await this.sock?.logout(); } catch { /* ignore */ }
     this.sock = undefined;
+    await this.flushAuthWrites();
     // `$set: { authCreds: undefined, ... }` is silently dropped by the Mongo driver
     // — it does NOT clear the field. The WhatsApp session credentials were NEVER
     // actually deleted on logout: they stayed in the document (retention of
@@ -587,7 +619,7 @@ export class BaileysSession implements IChannelSession {
     // recover. Needs an actual $unset.
     await Instance.findByIdAndUpdate(this.instanceId, {
       $set: { status: 'disconnected' },
-      $unset: { authCreds: 1, authKeys: 1, qrCode: 1 },
+      $unset: { authCreds: 1, authKeys: 1, qrCode: 1, qrExpiresAt: 1, pairingCode: 1 },
     });
   }
 

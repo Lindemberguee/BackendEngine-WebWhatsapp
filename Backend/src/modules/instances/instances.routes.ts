@@ -26,8 +26,8 @@ export async function instancesRoutes(fastify: FastifyInstance, opts: { sessionM
 
   // GET /api/instances
   fastify.get('/', auth, async (request, reply) => {
-    const { workspaceId } = request.user as { workspaceId: string };
-    return reply.send(await svc.list(workspaceId));
+    const { workspaceId, role } = request.user as { workspaceId: string; role: string };
+    return reply.send(await svc.list(workspaceId, role === 'owner' || role === 'admin'));
   });
 
   // POST /api/instances
@@ -95,6 +95,7 @@ export async function instancesRoutes(fastify: FastifyInstance, opts: { sessionM
         name: name.trim(), phoneNumberId: phoneNumberId.trim(), wabaId: wabaId.trim(),
         businessId: businessId?.trim() || undefined, accessToken,
         tokenExpiresAt: tokenInfo.expiresAt, tokenScopes: tokenInfo.scopes,
+        appSource: 'platform',
       });
       return reply.status(201).send(instance);
     } catch (err) {
@@ -153,7 +154,7 @@ export async function instancesRoutes(fastify: FastifyInstance, opts: { sessionM
 
       let tokenExpiresAt: Date | undefined;
       let tokenScopes: string[] | undefined;
-      if (process.env.META_APP_ID && process.env.META_APP_SECRET) {
+      if (instance.cloudApi.appSource === 'platform' && process.env.META_APP_ID && process.env.META_APP_SECRET) {
         const tokenInfo = await debugAccessToken(accessToken);
         const requiredScopes = ['whatsapp_business_messaging', 'whatsapp_business_management'];
         const missingScopes = requiredScopes.filter((scope) => !tokenInfo.scopes.includes(scope));
@@ -169,7 +170,6 @@ export async function instancesRoutes(fastify: FastifyInstance, opts: { sessionM
         'cloudApi.verifiedName': health.verifiedName,
         'cloudApi.qualityRating': health.qualityRating,
         'cloudApi.lastHealthCheckAt': new Date(),
-        status: 'connected',
       };
       if (tokenExpiresAt) set['cloudApi.tokenExpiresAt'] = tokenExpiresAt;
       if (tokenScopes) set['cloudApi.tokenScopes'] = tokenScopes;
@@ -243,9 +243,9 @@ export async function instancesRoutes(fastify: FastifyInstance, opts: { sessionM
 
   // GET /api/instances/:id
   fastify.get('/:id', auth, async (request, reply) => {
-    const { workspaceId } = request.user as { workspaceId: string };
+    const { workspaceId, role } = request.user as { workspaceId: string; role: string };
     const { id } = request.params as { id: string };
-    const instance = await svc.get(workspaceId, id);
+    const instance = await svc.get(workspaceId, id, role === 'owner' || role === 'admin');
     if (!instance) return reply.status(404).send({ error: 'Instância não encontrada' });
     return reply.send(instance);
   });

@@ -10,9 +10,14 @@ const DEFAULT_GRAPH_VERSION = process.env.META_GRAPH_VERSION ?? 'v25.0';
 type Actor = { id: string; name: string; email: string };
 
 /** Attaches real, computed usage stats to an instance response — no fabricated numbers. */
-async function withStats(instanceDoc: { toJSON: () => Record<string, unknown> } | null) {
+async function withStats(instanceDoc: { toJSON: () => Record<string, unknown> } | null, includePairing = false) {
   if (!instanceDoc) return null;
   const instance = instanceDoc.toJSON();
+  if (!includePairing) {
+    delete instance.qrCode;
+    delete instance.qrExpiresAt;
+    delete instance.pairingCode;
+  }
   const instanceId = instance.id as string;
   const todayStart = new Date();
   todayStart.setHours(0, 0, 0, 0);
@@ -32,14 +37,14 @@ async function withStats(instanceDoc: { toJSON: () => Record<string, unknown> } 
 
 export function createInstancesService(sessionManager: SessionManager) {
   return {
-    async list(workspaceId: string) {
+    async list(workspaceId: string, includePairing = false) {
       const docs = await Instance.find({ workspaceId }).select('-authCreds -authKeys').sort({ createdAt: -1 });
-      return Promise.all(docs.map((d) => withStats(d)));
+      return Promise.all(docs.map((d) => withStats(d, includePairing)));
     },
 
-    async get(workspaceId: string, instanceId: string) {
+    async get(workspaceId: string, instanceId: string, includePairing = false) {
       const doc = await Instance.findOne({ _id: instanceId, workspaceId }).select('-authCreds -authKeys');
-      return withStats(doc);
+      return withStats(doc, includePairing);
     },
 
     async create(workspaceId: string, name: string, webhookUrl?: string) {
@@ -58,9 +63,22 @@ export function createInstancesService(sessionManager: SessionManager) {
      * sessionManager.startSession() → CloudApiSession.connect() right after,
      * same as how a Baileys instance validates by actually trying to connect.
      */
-    async createCloudApi(workspaceId: string, params: { name: string; phoneNumberId: string; wabaId: string; accessToken: string; businessId?: string; tokenExpiresAt?: Date; tokenScopes?: string[] }) {
+    async createCloudApi(workspaceId: string, params: { name: string; phoneNumberId: string; wabaId: string; accessToken: string; businessId?: string; tokenExpiresAt?: Date; tokenScopes?: string[]; appSource?: 'platform' | 'customer' }) {
       await assertCanCreateInstance(workspaceId);
       await assertOfficialChannelEnabled(workspaceId);
+      // Enforce uniqueness in MongoDB, including concurrent requests/processes.
+      // Existing duplicates must be resolved deliberately, never deleted here.
+      try {
+        await Instance.collection.createIndex({ 'cloudApi.phoneNumberId': 1 }, {
+          name: 'unique_cloud_phone', unique: true,
+          partialFilterExpression: { channel: 'cloud_api', 'cloudApi.phoneNumberId': { $type: 'string' } },
+        });
+      } catch {
+        throw new Error('Não foi possível garantir a exclusividade dos números. Solicite ao administrador a revisão de cadastros duplicados.');
+      }
+      if (await Instance.exists({ channel: 'cloud_api', 'cloudApi.phoneNumberId': params.phoneNumberId })) {
+        throw new Error('Este número já está vinculado. Use a instância existente ou solicite a transferência ao administrador.');
+      }
       const instance = await Instance.create({
         workspaceId,
         name: params.name,
@@ -75,13 +93,17 @@ export function createInstancesService(sessionManager: SessionManager) {
           // (a later stage) but isn't collected in this manual-credentials flow yet —
           // stored empty until that UI field is added; the webhook route treats an
           // empty secret as "signature verification not yet configured".
-          appSecretEnc: encryptSecret(process.env.META_APP_SECRET ?? ''),
+          appSource: params.appSource ?? 'customer',
+          appSecretEnc: encryptSecret(params.appSource === 'platform' ? process.env.META_APP_SECRET ?? '' : ''),
           verifyToken: randomBytes(24).toString('hex'),
           tokenLast4: last4(params.accessToken),
           graphVersion: DEFAULT_GRAPH_VERSION,
           tokenExpiresAt: params.tokenExpiresAt,
           tokenScopes: params.tokenScopes,
         },
+      }).catch((error: { code?: number }) => {
+        if (error.code === 11000) throw new Error('Este número já está vinculado a uma instância.');
+        throw error;
       });
       // Validate the credentials immediately (fire-and-forget, same pattern as
       // the Baileys create() below) — errors surface via status/errorMessage on
@@ -95,7 +117,7 @@ export function createInstancesService(sessionManager: SessionManager) {
     async getWebhookConfig(workspaceId: string, instanceId: string) {
       const instance = await Instance.findOne({ _id: instanceId, workspaceId, channel: 'cloud_api' }).select('cloudApi').lean();
       if (!instance?.cloudApi) return null;
-      const sharedVerifyToken = process.env.META_WEBHOOK_VERIFY_TOKEN;
+      const sharedVerifyToken = instance.cloudApi.appSource === 'platform' ? process.env.META_WEBHOOK_VERIFY_TOKEN : undefined;
       const webhookPath = sharedVerifyToken
         ? '/api/webhooks/meta'
         : `/api/webhooks/meta/${instanceId}`;
@@ -117,7 +139,7 @@ export function createInstancesService(sessionManager: SessionManager) {
     async setAppSecret(workspaceId: string, instanceId: string, appSecret: string) {
       const instance = await Instance.findOneAndUpdate(
         { _id: instanceId, workspaceId, channel: 'cloud_api' },
-        { $set: { 'cloudApi.appSecretEnc': encryptSecret(appSecret) } },
+        { $set: { 'cloudApi.appSecretEnc': encryptSecret(appSecret), 'cloudApi.appSource': 'customer' }, $unset: { 'cloudApi.lastWebhookAt': 1 } },
         { new: true }
       ).select('-authCreds -authKeys');
       if (!instance) throw new Error('Instância não encontrada ou não é da API Oficial');
@@ -168,7 +190,6 @@ export function createInstancesService(sessionManager: SessionManager) {
       const instance = await Instance.findOne({ _id: instanceId, workspaceId });
       if (!instance) throw new Error('Instância não encontrada');
       await sessionManager.disconnectSession(instanceId);
-      await Instance.findByIdAndUpdate(instanceId, { status: 'disconnected' });
       return { message: 'Desconectado' };
     },
 
@@ -180,7 +201,6 @@ export function createInstancesService(sessionManager: SessionManager) {
       // Same $set/undefined pitfall as update() above — qrCode/pairingCode were
       // never actually cleared, so a logged-out instance kept showing (and the
       // API kept returning) a stale, already-invalid QR/pairing code forever.
-      await Instance.findByIdAndUpdate(instanceId, { $set: { status: 'disconnected' }, $unset: { qrCode: 1, pairingCode: 1 } });
       return { message: 'Sessão encerrada' };
     },
 
@@ -201,28 +221,12 @@ export function createInstancesService(sessionManager: SessionManager) {
       if (instance.status === 'connected') {
         throw new Error('Instância já está conectada — desconecte antes de parear outro número');
       }
+      if (instance.channel === 'cloud_api') throw new Error('A API Oficial não utiliza código de pareamento.');
 
       const cleanPhone = phone.replace(/\D/g, '');
       if (cleanPhone.length < 10 || cleanPhone.length > 15) throw new Error('Telefone inválido');
 
-      const session = sessionManager.getSession(instanceId) ?? await sessionManager.startSession(instanceId);
-
-      // The socket object exists as soon as startSession() resolves, but the
-      // underlying WebSocket handshake to WhatsApp's servers may not have finished
-      // yet — requestPairingCode can fail in that narrow window. A single fixed
-      // 2s guess either wasted time when the socket was already ready, or wasn't
-      // long enough on a slow connection. Retry with a short backoff instead.
-      let lastErr: unknown;
-      for (let attempt = 0; attempt < 5; attempt++) {
-        try {
-          const code = await session.requestPairingCode!(cleanPhone);
-          return { pairingCode: code };
-        } catch (err) {
-          lastErr = err;
-          await new Promise((r) => setTimeout(r, 500));
-        }
-      }
-      throw lastErr instanceof Error ? lastErr : new Error('Falha ao gerar código de pareamento');
+      return { pairingCode: await sessionManager.requestPairingCode(instanceId, cleanPhone) };
     },
 
     async delete(workspaceId: string, instanceId: string, actor?: Actor) {

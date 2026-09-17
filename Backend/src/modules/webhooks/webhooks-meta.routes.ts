@@ -229,12 +229,13 @@ export async function webhooksMetaRoutes(
     const query = request.query as Record<string, string>;
     if (query['hub.mode'] !== 'subscribe' || !query['hub.verify_token']) return reply.status(403).send({ error: 'Verificação inválida' });
 
-    let expected = process.env.META_WEBHOOK_VERIFY_TOKEN;
-    if (!expected && instanceId) {
+    let expected = instanceId ? undefined : process.env.META_WEBHOOK_VERIFY_TOKEN;
+    if (instanceId) {
       const instance = await Instance.findById(instanceId).select('cloudApi.verifyToken channel').lean();
       if (instance?.channel === 'cloud_api') expected = instance.cloudApi?.verifyToken;
     }
     if (!expected || !safeEqual(query['hub.verify_token'], expected)) return reply.status(403).send({ error: 'Verify token inválido' });
+    if (instanceId) await Instance.updateOne({ _id: instanceId }, { $set: { 'cloudApi.lastWebhookVerifiedAt': new Date() } });
     return reply.status(200).send(query['hub.challenge'] ?? '');
   };
 
@@ -248,6 +249,9 @@ export async function webhooksMetaRoutes(
 
     const metadataPhoneId = phoneNumberId(json);
     const eventWabaId = payloadWabaId(json);
+    if (metadataPhoneId && await Instance.countDocuments({ channel: 'cloud_api', 'cloudApi.phoneNumberId': metadataPhoneId }) > 1) {
+      return reply.status(409).send({ error: 'Número com vínculo ambíguo. Revise as instâncias duplicadas.' });
+    }
     const instance = instanceId
       ? await Instance.findById(instanceId)
       : metadataPhoneId
@@ -260,12 +264,17 @@ export async function webhooksMetaRoutes(
     if (metadataPhoneId && metadataPhoneId !== instance.cloudApi.phoneNumberId) return reply.status(403).send({ error: 'Phone Number ID não corresponde à instância' });
     if (!metadataPhoneId && eventWabaId !== instance.cloudApi.wabaId) return reply.status(403).send({ error: 'WABA ID não corresponde à instância' });
 
-    const appSecret = process.env.META_APP_SECRET || (instance.cloudApi.appSecretEnc ? decryptSecret(instance.cloudApi.appSecretEnc) : '');
+    const storedSecret = instance.cloudApi.appSecretEnc ? decryptSecret(instance.cloudApi.appSecretEnc) : '';
+    const appSecret = instance.cloudApi.appSource === 'platform'
+      ? process.env.META_APP_SECRET || storedSecret
+      : storedSecret || (instance.cloudApi.appSource ? '' : process.env.META_APP_SECRET || '');
     const signature = request.headers['x-hub-signature-256'];
     const expected = `sha256=${createHmac('sha256', appSecret).update(raw).digest('hex')}`;
     if (!appSecret || typeof signature !== 'string' || !safeEqual(signature, expected)) {
       return reply.status(401).send({ error: 'Assinatura inválida' });
     }
+    await Instance.updateOne({ _id: instance._id }, { $set: { 'cloudApi.lastWebhookAt': new Date() } });
+    if (!instance.cloudApi.lastWebhookAt) opts.wsGateway.broadcastInstanceStatus(instance.workspaceId.toString(), instance._id.toString(), instance.status);
 
     const digest = createHash('sha256').update(raw).digest('hex');
     let eventId: string | undefined;

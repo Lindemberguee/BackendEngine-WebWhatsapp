@@ -45,10 +45,17 @@ function encodeKeyId(id: string): string {
   return id.replace(/\./g, ID_DOT);
 }
 
-export async function useMongoAuthState(instanceId: string): Promise<{
+export async function useMongoAuthState(instanceId: string, isActive: () => boolean = () => true): Promise<{
   state: { creds: AuthenticationCreds; keys: SignalKeyStore };
   saveCreds: () => Promise<void>;
+  flushWrites: () => Promise<void>;
 }> {
+  let pendingWrite: Promise<void> = Promise.resolve();
+  const enqueue = (write: () => Promise<unknown>): Promise<void> => {
+    const current = pendingWrite.catch(() => {}).then(async () => { if (isActive()) await write(); });
+    pendingWrite = current;
+    return current;
+  };
   // Only authCreds is needed here (keys are read lazily per-id in keys.get below) —
   // selecting it explicitly avoids pulling the entire (potentially large) authKeys
   // blob into memory just to read one field.
@@ -95,17 +102,17 @@ export async function useMongoAuthState(instanceId: string): Promise<{
       if (Object.keys(unsetOps).length) update['$unset'] = unsetOps;
 
       if (Object.keys(update).length) {
-        await Instance.updateOne({ _id: instanceId }, update);
+        await enqueue(() => Instance.updateOne({ _id: instanceId }, update).exec());
       }
     },
   };
 
   const saveCreds = async () => {
-    await Instance.updateOne(
+    await enqueue(() => Instance.updateOne(
       { _id: instanceId },
       { $set: { authCreds: encodeForStorage(creds) } }
-    );
+    ).exec());
   };
 
-  return { state: { creds, keys }, saveCreds };
+  return { state: { creds, keys }, saveCreds, flushWrites: () => pendingWrite.catch(() => {}) };
 }

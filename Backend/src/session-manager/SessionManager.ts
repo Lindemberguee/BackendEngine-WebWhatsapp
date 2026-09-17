@@ -12,6 +12,7 @@ const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' });
 
 export class SessionManager {
   private sessions = new Map<string, IChannelSession>();
+  private operations = new Map<string, Promise<unknown>>();
   private cloudHealthTimer?: NodeJS.Timeout;
 
   constructor(private readonly wsGateway: WebSocketGateway) {}
@@ -34,14 +35,27 @@ export class SessionManager {
 
   /** Return the live session, lazily (re)starting it from saved creds if absent. */
   async ensureSession(instanceId: string): Promise<IChannelSession> {
-    return this.sessions.get(instanceId) ?? this.startSession(instanceId);
+    return this.startSession(instanceId);
   }
 
-  async startSession(instanceId: string): Promise<IChannelSession> {
+  private async serialize<T>(instanceId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.operations.get(instanceId) ?? Promise.resolve();
+    const current = previous.catch(() => {}).then(operation);
+    this.operations.set(instanceId, current);
+    try { return await current; }
+    finally { if (this.operations.get(instanceId) === current) this.operations.delete(instanceId); }
+  }
+
+  startSession(instanceId: string): Promise<IChannelSession> {
+    return this.serialize(instanceId, () => this.startUnlocked(instanceId));
+  }
+
+  private async startUnlocked(instanceId: string): Promise<IChannelSession> {
     if (this.sessions.has(instanceId)) {
       return this.sessions.get(instanceId)!;
     }
     const instance = await Instance.findById(instanceId).select('channel').lean();
+    if (!instance) throw new Error('Instância não encontrada');
     // Evict on the channel's own "logged out" signal too, not just the explicit
     // logoutSession() path below — otherwise a dead session stays cached forever
     // and a later re-connect attempt resurrects/reuses a corpse.
@@ -70,16 +84,26 @@ export class SessionManager {
     return this.sessions.get(instanceId) ?? null;
   }
 
-  async logoutSession(instanceId: string): Promise<void> {
-    const session = this.sessions.get(instanceId);
-    if (session) {
-      await session.logout();
-      this.sessions.delete(instanceId);
-      logger.info({ instanceId }, '[SessionManager] Session logged out');
-    }
+  logoutSession(instanceId: string): Promise<void> {
+    return this.serialize(instanceId, async () => {
+      const instance = await Instance.findById(instanceId).select('channel workspaceId').lean();
+      const session = this.sessions.get(instanceId);
+      try { if (session) await session.logout(); }
+      finally {
+        session?.disconnect();
+        this.sessions.delete(instanceId);
+        await Instance.updateOne({ _id: instanceId }, {
+          $set: { status: 'disconnected', lastDisconnectedAt: new Date(),
+            ...(instance?.channel === 'cloud_api' ? { 'cloudApi.accessTokenEnc': '', 'cloudApi.tokenLast4': '' } : {}) },
+          $unset: { authCreds: 1, authKeys: 1, qrCode: 1, qrExpiresAt: 1, pairingCode: 1, errorMessage: 1,
+            ...(instance?.channel === 'cloud_api' ? { 'cloudApi.lastHealthSuccessAt': 1, 'cloudApi.tokenExpiresAt': 1, 'cloudApi.tokenScopes': 1 } : {}) },
+        });
+        if (instance) this.wsGateway.broadcastInstanceStatus(instance.workspaceId.toString(), instanceId, 'disconnected');
+      }
+    });
   }
 
-  async disconnectSession(instanceId: string): Promise<void> {
+  private disconnectUnlocked(instanceId: string): void {
     const session = this.sessions.get(instanceId);
     if (session) {
       session.disconnect();
@@ -88,9 +112,37 @@ export class SessionManager {
     }
   }
 
-  async restartSession(instanceId: string): Promise<IChannelSession> {
-    await this.disconnectSession(instanceId);
-    return this.startSession(instanceId);
+  disconnectSession(instanceId: string): Promise<void> {
+    return this.serialize(instanceId, async () => {
+      this.disconnectUnlocked(instanceId);
+      const instance = await Instance.findByIdAndUpdate(instanceId, {
+        $set: { status: 'disconnected', lastDisconnectedAt: new Date() },
+        $unset: { qrCode: 1, qrExpiresAt: 1, pairingCode: 1 },
+      }).select('workspaceId');
+      if (instance) this.wsGateway.broadcastInstanceStatus(instance.workspaceId.toString(), instanceId, 'disconnected');
+    });
+  }
+
+  requestPairingCode(instanceId: string, phone: string): Promise<string> {
+    return this.serialize(instanceId, async () => {
+      const instance = await Instance.findById(instanceId).select('status channel');
+      if (!instance || instance.channel === 'cloud_api') throw new Error('Instância não aceita pareamento por telefone');
+      if (instance.status === 'connected') throw new Error('Instância já conectada');
+      const session = await this.startUnlocked(instanceId);
+      let lastError: unknown;
+      for (let attempt = 0; attempt < 5; attempt++) {
+        try { return await session.requestPairingCode!(phone); }
+        catch (error) { lastError = error; if (attempt < 4) await new Promise((resolve) => setTimeout(resolve, 500)); }
+      }
+      throw lastError instanceof Error ? lastError : new Error('Falha ao gerar código de pareamento');
+    });
+  }
+
+  restartSession(instanceId: string): Promise<IChannelSession> {
+    return this.serialize(instanceId, async () => {
+      this.disconnectUnlocked(instanceId);
+      return this.startUnlocked(instanceId);
+    });
   }
 
   listActive(): string[] {
@@ -122,6 +174,7 @@ export class SessionManager {
           'cloudApi.verifiedName': health.verifiedName,
           'cloudApi.displayPhoneNumber': health.displayPhoneNumber,
           'cloudApi.lastHealthCheckAt': new Date(),
+          'cloudApi.lastHealthSuccessAt': new Date(),
         }, $unset: { errorMessage: 1 } });
       } catch (err) {
         await Instance.updateOne({ _id: instance._id }, { $set: { status: 'error', errorMessage: (err as Error).message, 'cloudApi.lastHealthCheckAt': new Date() } });
@@ -143,14 +196,17 @@ export class SessionManager {
       const health = await validatePhoneNumber({ phoneNumberId: instance.cloudApi.phoneNumberId, accessToken, graphVersion: instance.cloudApi.graphVersion });
       await Instance.updateOne({ _id: instance._id }, {
         $set: {
-          status: 'connected',
           'cloudApi.qualityRating': health.qualityRating,
           'cloudApi.verifiedName': health.verifiedName,
           'cloudApi.displayPhoneNumber': health.displayPhoneNumber,
           'cloudApi.lastHealthCheckAt': new Date(),
+          'cloudApi.lastHealthSuccessAt': new Date(),
         },
         $unset: { errorMessage: 1 },
       });
+      // Only the session connection may transition to connected. A metadata
+      // check alone does not subscribe webhooks or restore an evicted session.
+      await this.restartSession(instanceId);
     } catch (err) {
       const message = (err as Error).message;
       await Instance.updateOne({ _id: instance._id }, { $set: { status: 'error', errorMessage: message, 'cloudApi.lastHealthCheckAt': new Date() } });

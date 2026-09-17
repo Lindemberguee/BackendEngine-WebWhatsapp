@@ -19,6 +19,7 @@ export interface IInstance extends Document {
   phone?: string;
   status: InstanceStatus;
   qrCode?: string;       // base64 PNG
+  qrExpiresAt?: Date;
   pairingCode?: string;  // 8-digit code
   // Baileys auth state (Signal Protocol session material) stored directly in the
   // document. Written as AES-256-GCM ciphertext strings via MongoAuthState.ts
@@ -40,6 +41,7 @@ export interface IInstance extends Document {
     displayPhoneNumber?: string;
     accessTokenEnc: string;
     appSecretEnc: string;
+    appSource?: 'platform' | 'customer';
     /** Random, server-generated — compared against Meta's webhook handshake
      *  `hub.verify_token`. Not chosen by the client. */
     verifyToken: string;
@@ -52,6 +54,9 @@ export interface IInstance extends Document {
     webhookSubscribed?: boolean;
     phoneRegisteredAt?: Date;
     lastHealthCheckAt?: Date;
+    lastHealthSuccessAt?: Date;
+    lastWebhookAt?: Date;
+    lastWebhookVerifiedAt?: Date;
     messagingLimit?: string;
     tokenExpiresAt?: Date;
     tokenExpiryAlertedAt?: Date;
@@ -69,6 +74,7 @@ const InstanceSchema = new Schema<IInstance>(
     phone:               { type: String },
     status:              { type: String, enum: ['disconnected', 'connecting', 'qr_pending', 'pairing_pending', 'connected', 'banned', 'error'], default: 'disconnected' },
     qrCode:              { type: String },
+    qrExpiresAt:         { type: Date },
     pairingCode:         { type: String },
     authCreds:           { type: Schema.Types.Mixed },
     authKeys:            { type: Schema.Types.Mixed },
@@ -83,6 +89,7 @@ const InstanceSchema = new Schema<IInstance>(
       displayPhoneNumber: { type: String },
       accessTokenEnc:     { type: String },
       appSecretEnc:       { type: String },
+      appSource:         { type: String, enum: ['platform', 'customer'] },
       verifyToken:        { type: String },
       tokenLast4:         { type: String },
       graphVersion:       { type: String },
@@ -91,6 +98,9 @@ const InstanceSchema = new Schema<IInstance>(
       webhookSubscribed:  { type: Boolean, default: false },
       phoneRegisteredAt:   { type: Date },
       lastHealthCheckAt:  { type: Date },
+      lastHealthSuccessAt: { type: Date },
+      lastWebhookAt:     { type: Date },
+      lastWebhookVerifiedAt: { type: Date },
       messagingLimit:     { type: String },
       tokenExpiresAt:     { type: Date },
       tokenExpiryAlertedAt: { type: Date },

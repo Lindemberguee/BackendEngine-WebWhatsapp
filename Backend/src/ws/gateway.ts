@@ -145,7 +145,15 @@ export class WebSocketGateway {
     status: string,
     extra?: Record<string, unknown>
   ): void {
-    this.broadcastToWorkspace(workspaceId, 'instance:status', { instanceId, status, ...extra });
+    const clients = this.rooms.get(workspaceId);
+    if (!clients) return;
+    const { qrCode, pairingCode, qrExpiresAt, ...publicExtra } = extra ?? {};
+    for (const client of clients) {
+      if (client.readyState !== 1) continue;
+      const role = this.socketMeta.get(client)?.role;
+      const pairing = role === 'owner' || role === 'admin' ? { qrCode, pairingCode, qrExpiresAt } : {};
+      client.send(JSON.stringify({ type: 'instance:status', instanceId, status, ...publicExtra, ...pairing }));
+    }
   }
 
   private addClient(workspaceId: string, socket: WebSocket): void {

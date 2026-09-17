@@ -57,6 +57,7 @@ export class CloudApiSession implements IChannelSession {
         graphVersion: instance.cloudApi.graphVersion,
       });
       await subscribeAppToWaba(instance.cloudApi.wabaId, accessToken, instance.cloudApi.graphVersion);
+      if (this.destroyed) return;
       this.ready = true;
       const phone = displayPhoneNumber ?? instance.cloudApi.displayPhoneNumber;
       await Instance.updateOne({ _id: this.instanceId }, {
@@ -67,6 +68,7 @@ export class CloudApiSession implements IChannelSession {
           'cloudApi.qualityRating': qualityRating,
           'cloudApi.webhookSubscribed': true,
           'cloudApi.lastHealthCheckAt': new Date(),
+          'cloudApi.lastHealthSuccessAt': new Date(),
         },
       });
       this.wsGateway.broadcastInstanceStatus(workspaceId, this.instanceId, 'connected', { phone });
@@ -134,7 +136,10 @@ export class CloudApiSession implements IChannelSession {
   async logout(): Promise<void> {
     this.destroyed = true;
     this.ready = false;
-    await Instance.updateOne({ _id: this.instanceId }, { $set: { status: 'disconnected' }, $unset: { cloudApi: 1, errorMessage: 1 } });
+    await Instance.updateOne({ _id: this.instanceId }, {
+      $set: { status: 'disconnected', 'cloudApi.accessTokenEnc': '', 'cloudApi.tokenLast4': '' },
+      $unset: { errorMessage: 1, 'cloudApi.lastHealthSuccessAt': 1, 'cloudApi.tokenExpiresAt': 1, 'cloudApi.tokenScopes': 1 },
+    });
     this.onLoggedOut?.();
   }
 
