@@ -41,7 +41,7 @@ function inferType(mime: string): 'image' | 'video' | 'audio' | 'document' {
 // scripts, etc.) since inferType() falls back to 'document' for anything unmatched.
 const ALLOWED_MEDIA_MIME_PREFIXES = ['image/', 'video/', 'audio/', 'application/pdf', 'application/msword',
   'application/vnd.openxmlformats-officedocument', 'application/vnd.ms-excel', 'application/vnd.ms-powerpoint',
-  'text/plain', 'text/csv', 'application/zip'];
+  'text/plain', 'text/csv', 'application/zip', 'application/vnd.rar', 'application/x-rar-compressed'];
 
 function isAllowedMediaMime(mime: string): boolean {
   return ALLOWED_MEDIA_MIME_PREFIXES.some((prefix) => mime.startsWith(prefix));
@@ -126,6 +126,9 @@ export async function messagesRoutes(fastify: FastifyInstance, opts: { sessionMa
         const approved = await WhatsAppTemplate.exists({ workspaceId, instanceId: conv.instanceId, name: body.templateName, language: body.language, status: 'APPROVED' });
         if (!approved) return reply.status(400).send({ error: 'Template não encontrado ou ainda não aprovado pela Meta. Sincronize os templates e tente novamente.' });
         const session = await opts.sessionManager.ensureSession(conv.instanceId.toString());
+        if (!(await session.waitUntilReady(8000))) {
+          return reply.status(503).send({ error: 'WhatsApp reconectando. Tente novamente em alguns segundos.' });
+        }
         const variables = Array.isArray(body.variables) ? body.variables : [];
         const components = Array.isArray(body.components)
           ? body.components
@@ -358,6 +361,12 @@ export async function messagesRoutes(fastify: FastifyInstance, opts: { sessionMa
 
       const type = (fields.type as 'image' | 'video' | 'audio' | 'document') || inferType(fileMime);
       const caption = fields.caption?.trim() || undefined;
+      const validTypes = new Set(['image', 'video', 'audio', 'document']);
+      if (!validTypes.has(type)) return reply.status(400).send({ error: 'Tipo de mensagem inválido' });
+      const typeMatchesMime = type === 'document'
+        ? !fileMime.startsWith('image/') && !fileMime.startsWith('video/') && !fileMime.startsWith('audio/')
+        : fileMime.startsWith(`${type}/`);
+      if (!typeMatchesMime) return reply.status(400).send({ error: 'O tipo informado não corresponde ao arquivo enviado' });
 
       const conv = await Conversation.findOne(scopeConversationFilter({ _id: conversationId, workspaceId }, { role, sub: agentId }));
       if (!conv) return reply.status(404).send({ error: 'Conversa não encontrada' });

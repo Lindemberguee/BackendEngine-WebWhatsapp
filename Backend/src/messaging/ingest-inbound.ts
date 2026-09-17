@@ -73,9 +73,7 @@ export async function ingestInboundMessage(p: NormalizedInbound, deps: IngestDep
   // Upsert conversation — use workspaceId+jid as the primary key so that manually-created
   // conversations (which have no instanceId) are found and updated rather than triggering
   // a duplicate-key error from the { workspaceId, jid } sparse unique index.
-  const conversation = await Conversation.findOneAndUpdate(
-    { workspaceId, instanceId, jid },
-    {
+  const conversationUpdate = {
       $setOnInsert: { workspaceId, jid, isGroup, phone },
       $set: {
         instanceId,
@@ -103,9 +101,28 @@ export async function ingestInboundMessage(p: NormalizedInbound, deps: IngestDep
       // clear anything) — these need an actual $unset.
       ...(fromMe ? {} : { $unset: { resolvedAt: 1, closeReasonId: 1, snoozedUntil: 1 } }),
       $inc: { unreadCount: fromMe ? 0 : 1 },
-    },
-    { upsert: true, new: true, setDefaultsOnInsert: true }
+  };
+
+  // Prefer the conversation already attached to this instance. If a manual
+  // conversation was created before an instance was selected, adopt that row
+  // instead of creating a second thread for the same WhatsApp JID.
+  let conversation = await Conversation.findOneAndUpdate(
+    { workspaceId, instanceId, jid }, conversationUpdate,
+    { new: true, setDefaultsOnInsert: true }
   );
+  if (!conversation) {
+    conversation = await Conversation.findOneAndUpdate(
+      { workspaceId, jid, $or: [{ instanceId: { $exists: false } }, { instanceId: null }] }, conversationUpdate,
+      { new: true, setDefaultsOnInsert: true }
+    );
+  }
+  if (!conversation) {
+    conversation = await Conversation.findOneAndUpdate(
+      { workspaceId, instanceId, jid }, conversationUpdate,
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+  }
+  if (!conversation) throw new Error('Falha ao criar conversa para mensagem recebida');
   // A fresh upsert has createdAt === updatedAt to the millisecond; used below to
   // gate one-time actions (e.g. CRM auto-lead-creation) to brand-new conversations only.
   const isNewConversation = conversation.createdAt.getTime() === conversation.updatedAt.getTime();
