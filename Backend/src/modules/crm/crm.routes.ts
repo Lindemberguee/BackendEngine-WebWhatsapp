@@ -14,6 +14,25 @@ import { escapeRegex } from '../../shared/string-utils';
 
 const valid = (id: string) => Types.ObjectId.isValid(id);
 
+function validateStages(stages: unknown): string | null {
+  if (!Array.isArray(stages) || stages.length < 2) return 'O funil precisa ter pelo menos 2 etapas';
+  const ids = new Set<string>();
+  let hasOpen = false;
+  let hasWon = false;
+  let hasLost = false;
+  for (const stage of stages as Array<Record<string, unknown>>) {
+    if (!stage || typeof stage.id !== 'string' || !stage.id.trim() || ids.has(stage.id)) return 'Etapas precisam ter identificadores únicos';
+    if (typeof stage.name !== 'string' || !stage.name.trim()) return 'Todas as etapas precisam de um nome';
+    if (!['open', 'won', 'lost'].includes(String(stage.kind))) return 'Tipo de etapa inválido';
+    ids.add(stage.id);
+    hasOpen ||= stage.kind === 'open';
+    hasWon ||= stage.kind === 'won';
+    hasLost ||= stage.kind === 'lost';
+  }
+  if (!hasOpen || !hasWon || !hasLost) return 'O funil precisa ter etapas abertas, ganha e perdida';
+  return null;
+}
+
 export async function crmRoutes(fastify: FastifyInstance, opts: { sessionManager: SessionManager; wsGateway: WebSocketGateway }): Promise<void> {
   const auth = { preHandler: [fastify.authenticate] };
   const canWrite = { preHandler: [fastify.authenticate, requireRole(['owner', 'admin', 'agent'])] };
@@ -40,6 +59,8 @@ export async function crmRoutes(fastify: FastifyInstance, opts: { sessionManager
       return reply.status(400).send({ error: (err as Error).message });
     }
     const stages = Array.isArray(body.stages) && body.stages.length ? body.stages : DEFAULT_STAGES;
+    const stagesError = validateStages(stages);
+    if (stagesError) return reply.status(400).send({ error: stagesError });
     const p = await Pipeline.create({
       workspaceId: new Types.ObjectId(workspaceId),
       name: body.name.trim(),
@@ -57,6 +78,11 @@ export async function crmRoutes(fastify: FastifyInstance, opts: { sessionManager
     if (!valid(id)) return reply.status(404).send({ error: 'Funil não encontrado' });
     const body = request.body as Record<string, unknown>;
     const update: Record<string, unknown> = {};
+    if ('name' in body && (typeof body.name !== 'string' || !body.name.trim())) return reply.status(400).send({ error: 'Nome é obrigatório' });
+    if ('stages' in body) {
+      const stagesError = validateStages(body.stages);
+      if (stagesError) return reply.status(400).send({ error: stagesError });
+    }
     for (const k of ['name', 'description', 'stages', 'archived', 'autoCreateFromConversation', 'customFieldDefs']) if (k in body) update[k] = body[k];
     const p = await Pipeline.findOneAndUpdate({ _id: id, workspaceId }, update, { new: true });
     if (!p) return reply.status(404).send({ error: 'Funil não encontrado' });
@@ -77,7 +103,13 @@ export async function crmRoutes(fastify: FastifyInstance, opts: { sessionManager
     const { workspaceId } = request.user as { workspaceId: string };
     const { pipelineId, from, to } = request.query as { pipelineId?: string; from?: string; to?: string };
     if (!pipelineId) return reply.status(400).send({ error: 'pipelineId é obrigatório' });
-    const range = { from: from ? new Date(from) : undefined, to: to ? new Date(to) : undefined };
+    const fromDate = from ? new Date(from) : undefined;
+    const toDate = to ? new Date(to) : undefined;
+    if ((fromDate && Number.isNaN(fromDate.getTime())) || (toDate && Number.isNaN(toDate.getTime()))) {
+      return reply.status(400).send({ error: 'Período inválido' });
+    }
+    if (fromDate && toDate && fromDate > toDate) return reply.status(400).send({ error: 'O início deve ser anterior ao fim' });
+    const range = { from: fromDate, to: toDate };
 
     if (pipelineId === 'all') {
       const report = await getCrossPipelineReport(workspaceId, range);
@@ -95,12 +127,22 @@ export async function crmRoutes(fastify: FastifyInstance, opts: { sessionManager
 
   fastify.get('/leads', auth, async (request, reply) => {
     const { workspaceId } = request.user as { workspaceId: string };
-    const { pipelineId, stage, assigneeId, tag, search, status } = request.query as Record<string, string>;
+    const { pipelineId, contactId, stage, assigneeId, tag, search, status } = request.query as Record<string, string>;
     const filter: Record<string, unknown> = { workspaceId };
-    if (pipelineId && valid(pipelineId)) filter.pipelineId = pipelineId;
+    if (pipelineId) {
+      if (pipelineId !== 'all' && !valid(pipelineId)) return reply.status(400).send({ error: 'pipelineId inválido' });
+      if (pipelineId !== 'all') filter.pipelineId = pipelineId;
+    }
+    if (contactId) {
+      if (!valid(contactId)) return reply.status(400).send({ error: 'contactId inválido' });
+      filter.contactId = contactId;
+    }
     if (stage) filter.stageId = stage;
     if (status) filter.status = status;
-    if (assigneeId && valid(assigneeId)) filter.assigneeId = assigneeId;
+    if (assigneeId) {
+      if (!valid(assigneeId)) return reply.status(400).send({ error: 'assigneeId inválido' });
+      filter.assigneeId = assigneeId;
+    }
     if (tag) filter.tags = tag;
     if (search) filter.title = { $regex: escapeRegex(search), $options: 'i' };
     const leads = await Lead.find(filter).sort({ stageId: 1, order: 1 })
