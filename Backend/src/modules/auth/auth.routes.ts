@@ -8,6 +8,7 @@ import { notify } from '../notifications/notification.service';
 import type { WebSocketGateway } from '../../ws/gateway';
 import { Avatar } from '../../db/models';
 import { safeEqual } from '../../shared/crypto';
+import { clearSessionCookies, issueSession, refreshSession, revokeAllUserSessions, revokeSession } from './session.service';
 
 function toMeResponse(user: NonNullable<Awaited<ReturnType<typeof getUserById>>>) {
   return {
@@ -36,13 +37,8 @@ export async function authRoutes(fastify: FastifyInstance, opts: { wsGateway: We
 
     try {
       const { user, workspaceId } = await registerWorkspace({ workspaceName, ownerName, email, password, acceptedTerms });
-      const token = fastify.jwt.sign({
-        sub: user._id!.toString(),
-        workspaceId,
-        role: user.role,
-        tokenVersion: user.tokenVersion,
-      });
-      return reply.status(201).send({ token, user: { id: user._id, name: user.name, email: user.email, role: user.role, workspaceId } });
+      await issueSession(fastify, reply, user);
+      return reply.status(201).send({ user: { id: user._id, name: user.name, email: user.email, role: user.role, workspaceId } });
     } catch (err) {
       return reply.status(409).send({ error: (err as Error).message });
     }
@@ -59,13 +55,13 @@ export async function authRoutes(fastify: FastifyInstance, opts: { wsGateway: We
     try {
       const user = await loginUser(email, password);
       const workspaceId = user.workspaceId.toString();
-      const token = fastify.jwt.sign({ sub: user._id!.toString(), workspaceId, role: user.role, tokenVersion: user.tokenVersion });
+      await issueSession(fastify, reply, user);
       void notify(opts.wsGateway, {
         workspaceId, recipientId: user._id!.toString(), type: 'security.new_login',
         title: 'Novo login realizado', message: `Login em ${new Date().toLocaleString('pt-BR')}`,
         link: '/settings',
       });
-      return reply.send({ token, user: { id: user._id, name: user.name, email: user.email, role: user.role, workspaceId, avatarUrl: user.avatarUrl } });
+      return reply.send({ user: { id: user._id, name: user.name, email: user.email, role: user.role, workspaceId, avatarUrl: user.avatarUrl } });
     } catch (err) {
       return reply.status(401).send({ error: (err as Error).message });
     }
@@ -81,16 +77,19 @@ export async function authRoutes(fastify: FastifyInstance, opts: { wsGateway: We
     if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
       return reply.status(400).send({ error: 'E-mail inválido' });
     }
-    fastify.log.warn({ email }, '[auth] forgot-password requested — email delivery not configured (no reset link sent)');
+    fastify.log.warn('[auth] forgot-password requested but email delivery is not configured');
     // TODO: generate a short-lived reset token, persist it, and email the reset link.
     return reply.send({ message: 'Se este e-mail estiver cadastrado, você receberá as instruções.' });
   });
 
   // POST /api/auth/refresh  (requires valid JWT — re-issues with fresh expiry)
-  fastify.post('/refresh', { preHandler: [fastify.authenticate] }, async (request, reply) => {
-    const { sub, workspaceId, role, tokenVersion } = request.user as { sub: string; workspaceId: string; role: string; tokenVersion?: number };
-    const token = fastify.jwt.sign({ sub, workspaceId, role, tokenVersion: tokenVersion ?? 0 });
-    return reply.send({ token });
+  fastify.post('/refresh', async (request, reply) => {
+    const refreshed = await refreshSession(fastify, reply, request.cookies.ww_refresh);
+    if (!refreshed) {
+      clearSessionCookies(reply);
+      return reply.status(401).send({ error: 'Sessão expirada — faça login novamente' });
+    }
+    return reply.send({ ok: true });
   });
 
   // GET /api/auth/me  (requires auth)
@@ -158,7 +157,7 @@ export async function authRoutes(fastify: FastifyInstance, opts: { wsGateway: We
 
   // POST /api/auth/me/password  (self-service password change)
   fastify.post('/me/password', { preHandler: [fastify.authenticate] }, async (request, reply) => {
-    const { sub, workspaceId, role } = request.user as { sub: string; workspaceId: string; role: string };
+    const { sub } = request.user as { sub: string };
     const { currentPassword, newPassword } = request.body as { currentPassword?: string; newPassword?: string };
     if (!currentPassword || !newPassword) return reply.status(400).send({ error: 'Informe a senha atual e a nova senha' });
     try {
@@ -169,16 +168,27 @@ export async function authRoutes(fastify: FastifyInstance, opts: { wsGateway: We
     // changeOwnPassword already bumped tokenVersion (invalidating every other session's token) —
     // re-issue a fresh token for THIS session so the caller isn't logged out too.
     const user = await getUserById(sub);
-    const token = fastify.jwt.sign({ sub, workspaceId, role, tokenVersion: user?.tokenVersion ?? 0 });
-    return reply.send({ token });
+    if (!user) return reply.status(401).send({ error: 'Sessão expirada — faça login novamente' });
+    await revokeAllUserSessions(sub);
+    await issueSession(fastify, reply, user, request.cookies.ww_refresh);
+    return reply.send({ ok: true });
   });
 
   // POST /api/auth/me/logout-other-sessions  (invalidate every JWT except the caller's, which is re-issued)
   fastify.post('/me/logout-other-sessions', { preHandler: [fastify.authenticate] }, async (request, reply) => {
-    const { sub, workspaceId, role } = request.user as { sub: string; workspaceId: string; role: string };
-    const newTokenVersion = await bumpTokenVersion(sub);
-    const token = fastify.jwt.sign({ sub, workspaceId, role, tokenVersion: newTokenVersion });
-    return reply.send({ token });
+    const { sub } = request.user as { sub: string };
+    await bumpTokenVersion(sub);
+    const user = await getUserById(sub);
+    if (!user) return reply.status(401).send({ error: 'Sessão expirada — faça login novamente' });
+    await revokeAllUserSessions(sub);
+    await issueSession(fastify, reply, user, request.cookies.ww_refresh);
+    return reply.send({ ok: true });
+  });
+
+  fastify.post('/logout', async (request, reply) => {
+    await revokeSession(request.cookies.ww_refresh);
+    clearSessionCookies(reply);
+    return reply.status(204).send();
   });
 
   // GET /api/auth/me/stats  (personal performance snapshot)

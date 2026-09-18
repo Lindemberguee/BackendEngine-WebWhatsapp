@@ -1,6 +1,7 @@
 import { createHmac } from 'crypto';
 import pino from 'pino';
 import { WebhookDelivery, WebhookSubscription } from '../../db/models';
+import { fetchPublicUrl } from '../../shared/public-fetch';
 
 const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' });
 
@@ -69,7 +70,7 @@ async function deliver(delivery: InstanceType<typeof WebhookDelivery>): Promise<
   const signature = signPayload(subscription.secret, body);
 
   try {
-    const res = await fetch(subscription.url, {
+    const res = await fetchPublicUrl(subscription.url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

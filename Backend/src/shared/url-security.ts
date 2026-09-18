@@ -10,6 +10,13 @@ function isBlockedIpv4(a: number, b: number): boolean {
   if (a === 192 && b === 168) return true; // 192.168.0.0/16
   if (a === 169 && b === 254) return true; // link-local, incl. cloud metadata 169.254.169.254
   if (a === 0) return true; // 0.0.0.0/8
+  if (a === 100 && b >= 64 && b <= 127) return true; // shared carrier-grade NAT
+  if (a === 192 && b === 0) return true; // protocol assignments
+  if (a === 192 && b === 2) return true; // TEST-NET-1
+  if (a === 198 && (b === 18 || b === 19)) return true; // benchmarking
+  if (a === 198 && b === 51) return true; // TEST-NET-2
+  if (a === 203 && b === 0) return true; // TEST-NET-3
+  if (a >= 224) return true; // multicast/reserved
   return false;
 }
 
@@ -66,3 +73,25 @@ export function isPublicHttpUrl(rawUrl: string): boolean {
 
   return true;
 }
+
+/** Resolves a hostname immediately before connecting and rejects every private,
+ * special-use or mixed public/private DNS answer. Call this from server-side
+ * request code, not only when a user registers the URL. */
+export async function resolvePublicHostname(hostname: string): Promise<{ address: string; family: 4 | 6 }> {
+  if (isIP(hostname)) {
+    const rawUrl = hostname.includes(':') ? `https://[${hostname}]/` : `https://${hostname}/`;
+    if (!isPublicHttpUrl(rawUrl)) throw new Error('Host interno não permitido');
+    return { address: hostname, family: isIP(hostname) as 4 | 6 };
+  }
+
+  const records = await lookup(hostname, { all: true, verbatim: true });
+  if (!records.length) throw new Error('Host não pôde ser resolvido');
+  for (const record of records) {
+    const rawUrl = record.family === 6 ? `https://[${record.address}]/` : `https://${record.address}/`;
+    if (!isPublicHttpUrl(rawUrl)) throw new Error('Host resolve para rede interna');
+  }
+  const first = records[0];
+  return { address: first.address, family: first.family as 4 | 6 };
+}
+import { lookup } from 'dns/promises';
+import { isIP } from 'net';

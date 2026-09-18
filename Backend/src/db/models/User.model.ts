@@ -77,7 +77,7 @@ UserSchema.methods.comparePassword = function (plain: string): Promise<boolean> 
 };
 
 UserSchema.pre('save', async function () {
-  if (this.isModified('passwordHash')) {
+  if (this.isModified('passwordHash') && this.$locals.skipPasswordHash !== true) {
     this.passwordHash = await bcrypt.hash(this.passwordHash, 12);
   }
 });

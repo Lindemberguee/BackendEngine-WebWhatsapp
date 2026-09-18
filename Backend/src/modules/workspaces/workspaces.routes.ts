@@ -9,6 +9,7 @@ import { deletionDeadline } from './workspace-deletion.service';
 import { validateWorkspaceTheme, type WorkspaceTheme } from './theme-validation';
 import { requireRole } from '../../utils/require-role';
 import type { WebSocketGateway } from '../../ws/gateway';
+import { issueSession } from '../auth/session.service';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -140,7 +141,7 @@ export async function workspacesRoutes(fastify: FastifyInstance, opts: { wsGatew
     await getOrCreateSubscription(ws._id.toString());
 
     // Create owner user record in new workspace
-    await User.create({
+    const owner = new User({
       workspaceId: ws._id,
       name: creator.name,
       email: creator.email,
@@ -149,6 +150,10 @@ export async function workspacesRoutes(fastify: FastifyInstance, opts: { wsGatew
       avatarUrl: creator.avatarUrl,
       isActive: true,
     });
+    // creator.passwordHash is already a bcrypt digest. Preserve it as-is rather
+    // than passing it through the model hook a second time.
+    owner.$locals.skipPasswordHash = true;
+    await owner.save();
 
     const data = await buildWorkspacePayload(ws.toObject());
     return reply.status(201).send({ data });
@@ -262,18 +267,12 @@ export async function workspacesRoutes(fastify: FastifyInstance, opts: { wsGatew
     // user had ever changed their password, hit "log out other sessions", or had
     // their role changed (all of which bump tokenVersion above 0): instant 401 right
     // after switching, indistinguishable from a broken feature.
-    const token = fastify.jwt.sign({
-      sub: String(targetUser._id),
-      workspaceId: targetWsId,
-      role: targetUser.role,
-      tokenVersion: targetUser.tokenVersion ?? 0,
-    });
+    await issueSession(fastify, reply, targetUser, request.cookies.ww_refresh);
 
     const workspace = await buildWorkspacePayload(ws);
 
     return reply.send({
       data: { workspace },
-      token,
       user: {
         id: targetUser._id,
         name: targetUser.name,

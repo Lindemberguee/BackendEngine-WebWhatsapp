@@ -5,6 +5,7 @@ import { Workspace, User, Subscription, Instance, Conversation, Invoice, Pricing
 import type { PricingCategory } from '../../db/models';
 import { getPlan, PLANS } from '../billing/plans.config';
 import { describeMediaStorage, testMediaStorageConnection } from '../../shared/media-storage';
+import { escapeRegex } from '../../shared/string-utils';
 
 function secureEqual(received: string, expected: string): boolean {
   const a = Buffer.from(received);
@@ -62,7 +63,10 @@ export async function platformRoutes(fastify: FastifyInstance): Promise<void> {
     const pageNumber = Math.max(1, Number(page) || 1);
     const pageSize = Math.min(100, Math.max(1, Number(limit) || 20));
     const filter: Record<string, unknown> = {};
-    if (search.trim()) filter.$or = [{ name: { $regex: search.trim(), $options: 'i' } }, { slug: { $regex: search.trim(), $options: 'i' } }];
+    if (search.trim()) {
+      const safeSearch = escapeRegex(search.trim());
+      filter.$or = [{ name: { $regex: safeSearch, $options: 'i' } }, { slug: { $regex: safeSearch, $options: 'i' } }];
+    }
     if (['starter', 'pro', 'enterprise'].includes(plan)) filter.plan = plan;
     if (status === 'active') filter.status = { $ne: 'suspended' };
     if (status === 'suspended') filter.status = 'suspended';

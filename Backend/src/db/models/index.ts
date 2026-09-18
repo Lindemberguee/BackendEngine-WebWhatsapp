@@ -1,5 +1,6 @@
 export { Workspace } from './Workspace.model';
 export { User } from './User.model';
+export { AuthSession } from './AuthSession.model';
 export { Instance } from './Instance.model';
 export { Conversation } from './Conversation.model';
 export { Message } from './Message.model';
@@ -35,6 +36,7 @@ export { Rating } from './Rating.model';
 export type { IFlowAsset } from './FlowAsset.model';
 export type { IWorkspace } from './Workspace.model';
 export type { IUser, UserRole, IUserStatus, UserAvailability } from './User.model';
+export type { IAuthSession } from './AuthSession.model';
 export type { IInstance, InstanceStatus } from './Instance.model';
 export type { IConversation, ConversationStatus } from './Conversation.model';
 export type { IMessage, MessageType, MessageStatus } from './Message.model';

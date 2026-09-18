@@ -5,7 +5,7 @@ export function requireRole(roles: string[]) {
   return async (request: FastifyRequest, reply: FastifyReply) => {
     const { role } = request.user as { role: string };
     if (!roles.includes(role)) {
-      reply.status(403).send({ error: 'Você não tem permissão para esta ação' });
+      return reply.status(403).send({ error: 'Você não tem permissão para esta ação' });
     }
   };
 }

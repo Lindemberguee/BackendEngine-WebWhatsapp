@@ -7,6 +7,7 @@ import jwt from '@fastify/jwt';
 import websocket from '@fastify/websocket';
 import multipart from '@fastify/multipart';
 import rateLimit from '@fastify/rate-limit';
+import cookie from '@fastify/cookie';
 import mongoose from 'mongoose';
 import { createHash } from 'crypto';
 import { connectDatabase, disconnectDatabase } from './db/connection';
@@ -54,6 +55,9 @@ import { platformRoutes } from './modules/platform/platform.routes';
 import { startScheduledMessageDispatcher, stopScheduledMessageDispatcher } from './modules/scheduled-messages/scheduled-message-scheduler';
 import { validateMediaStorageConfig } from './shared/media-storage';
 import { runStartupDiagnostics } from './shared/startup-diagnostics';
+import { ACCESS_COOKIE } from './modules/auth/session.service';
+
+const ROLE_RANK = { viewer: 1, agent: 2, admin: 3, owner: 4 } as const;
 
 // ── Error tracking ─────────────────────────────────────────────────────────────
 // No-op without a DSN — local/dev never sends anything anywhere. Set SENTRY_DSN
@@ -171,6 +175,8 @@ async function bootstrap(): Promise<void> {
     allowList: process.env.NODE_ENV !== 'production' ? ['127.0.0.1', '::1'] : [],
   });
 
+  await fastify.register(cookie);
+
   // Falling back to a literal secret in production would let anyone forge a
   // valid token for any user/workspace — fail loudly at boot instead of
   // silently running with a guessable secret.
@@ -182,7 +188,8 @@ async function bootstrap(): Promise<void> {
     // No refresh-token flow exists yet, so this is the pragmatic mitigation for
     // "a leaked token is valid forever" — every fastify.jwt.sign() call across
     // the app picks this up automatically. Users simply log in again after 30d.
-    sign: { expiresIn: '30d' },
+    sign: { expiresIn: '15m' },
+    cookie: { cookieName: ACCESS_COOKIE, signed: false },
   });
 
   await fastify.register(websocket);
@@ -229,8 +236,11 @@ async function bootstrap(): Promise<void> {
       if (!key) return reply.status(401).send({ error: 'Chave de API inválida ou revogada' });
       const keyWorkspace = await Workspace.findById(key.workspaceId).select('status').lean();
       if (!keyWorkspace || keyWorkspace.status === 'suspended') return reply.status(403).send({ error: 'Workspace suspenso' });
+      const creator = await User.findOne({ _id: key.createdBy, workspaceId: key.workspaceId, isActive: true }).select('role').lean();
+      if (!creator) return reply.status(401).send({ error: 'Invalid API key' });
+      const role = ROLE_RANK[key.role] <= ROLE_RANK[creator.role] ? key.role : creator.role;
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (request as any).user = { sub: key.createdBy.toString(), workspaceId: key.workspaceId.toString(), role: key.role };
+      (request as any).user = { sub: key.createdBy.toString(), workspaceId: key.workspaceId.toString(), role };
       void ApiKey.updateOne({ _id: key._id }, { $set: { lastUsedAt: new Date() } }).catch(() => {});
       return;
     }
@@ -243,9 +253,9 @@ async function bootstrap(): Promise<void> {
     // tokenVersion check — lets "change password" / "log out other sessions" invalidate
     // every previously-issued JWT immediately, since JWTs are otherwise stateless.
     // Tokens signed before this field existed have tokenVersion undefined and are treated as 0.
-    const { sub, tokenVersion } = request.user as { sub: string; tokenVersion?: number };
+    const { sub, tokenVersion, workspaceId } = request.user as { sub: string; tokenVersion?: number; workspaceId?: string };
     const current = await User.findById(sub).select('tokenVersion isActive workspaceId').lean();
-    if (!current || (current.tokenVersion ?? 0) !== (tokenVersion ?? 0)) {
+    if (!current || (current.tokenVersion ?? 0) !== (tokenVersion ?? 0) || current.workspaceId.toString() !== workspaceId) {
       return reply.status(401).send({ error: 'Sessão expirada — faça login novamente' });
     }
     // A deactivated agent's existing token stays structurally valid (same

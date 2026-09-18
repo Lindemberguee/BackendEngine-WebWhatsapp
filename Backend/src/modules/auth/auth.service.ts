@@ -1,4 +1,5 @@
 import { Types } from 'mongoose';
+import bcrypt from 'bcrypt';
 import { User, Workspace, Conversation, Message, Lead, AuditLog } from '../../db/models';
 import type { IUser } from '../../db/models';
 import { getOrCreateSubscription } from '../billing/billing.service';
@@ -59,18 +60,20 @@ export async function registerWorkspace(data: {
 }
 
 export async function loginUser(email: string, password: string): Promise<IUser> {
-  const user = await User.findOne({ email: email.trim().toLowerCase(), isActive: true });
-  if (!user) throw new Error('Credenciais inválidas');
+  const users = await User.find({ email: email.trim().toLowerCase(), isActive: true });
+  let hasValidCredential = false;
+  for (const user of users) {
+    if (!(await user.comparePassword(password))) continue;
+    hasValidCredential = true;
 
-  const valid = await user.comparePassword(password);
-  if (!valid) throw new Error('Credenciais inválidas');
+    const workspace = await Workspace.findById(user.workspaceId).select('status').lean();
+    if (!workspace || workspace.status === 'suspended') continue;
 
-  const workspace = await Workspace.findById(user.workspaceId).select('status').lean();
-  if (!workspace || workspace.status === 'suspended') throw new Error('Workspace suspenso — fale com o suporte');
-
-  await User.updateOne({ _id: user._id }, { lastLoginAt: new Date() });
-
-  return user;
+    await User.updateOne({ _id: user._id }, { lastLoginAt: new Date() });
+    return user;
+  }
+  if (hasValidCredential) throw new Error('Workspace suspenso — fale com o suporte');
+  throw new Error('Credenciais inválidas');
 }
 
 export async function getUserById(userId: string): Promise<IUser | null> {
@@ -99,15 +102,23 @@ export async function changeOwnPassword(userId: string, currentPassword: string,
   const valid = await user.comparePassword(currentPassword);
   if (!valid) throw new Error('Senha atual incorreta');
   if (newPassword.length < 8) throw new Error('A nova senha deve ter pelo menos 8 caracteres');
-  user.passwordHash = newPassword; // pre('save') hook re-hashes
-  user.tokenVersion += 1; // password change also invalidates other sessions
-  await user.save();
+  // A person has one credential across every workspace they can switch to. Keep
+  // all identity records aligned; otherwise an older workspace record could still
+  // accept the previous password or its older JWTs.
+  const passwordHash = await bcrypt.hash(newPassword, 12);
+  await User.updateMany(
+    { email: user.email },
+    { $set: { passwordHash }, $inc: { tokenVersion: 1 } },
+  );
 }
 
 /** Bumps tokenVersion so every previously-issued JWT stops validating — "log out other sessions". */
 export async function bumpTokenVersion(userId: string): Promise<number> {
-  const user = await User.findByIdAndUpdate(userId, { $inc: { tokenVersion: 1 } }, { new: true }).select('tokenVersion');
-  return user?.tokenVersion ?? 0;
+  const user = await User.findById(userId).select('email');
+  if (!user) return 0;
+  await User.updateMany({ email: user.email }, { $inc: { tokenVersion: 1 } });
+  const current = await User.findById(userId).select('tokenVersion');
+  return current?.tokenVersion ?? 0;
 }
 
 /**

@@ -1,4 +1,5 @@
 import { Types } from 'mongoose';
+import bcrypt from 'bcrypt';
 import { User, AuditLog } from '../../db/models';
 import type { IUser, UserRole, IUserStatus, UserAvailability } from '../../db/models';
 import { assertCanCreateAgent } from '../billing/billing.service';
@@ -173,11 +174,14 @@ export async function resetAgentPassword(
   // owner's password and sign in as them — the one role update/removal can't touch.
   if (user.role === 'owner') throw new Error('O proprietário não pode ser alterado');
 
-  // The pre-save hook hashes the password. Also bump tokenVersion so any session
-  // signed in with the old password is invalidated immediately.
-  user.passwordHash = newPassword;
-  user.tokenVersion += 1;
-  await user.save();
+  // This account can be represented in more than one switchable workspace.
+  // Hash once and update every identity record so an old workspace record never
+  // preserves the previous password or a valid session.
+  const passwordHash = await bcrypt.hash(newPassword, 12);
+  await User.updateMany(
+    { email: user.email },
+    { $set: { passwordHash }, $inc: { tokenVersion: 1 } },
+  );
 }
 
 const AVAILABILITY_VALUES: UserAvailability[] = ['available', 'busy', 'offline'];

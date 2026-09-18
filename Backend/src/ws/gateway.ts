@@ -2,6 +2,7 @@ import type { FastifyInstance } from 'fastify';
 import type { WebSocket } from '@fastify/websocket';
 import pino from 'pino';
 import { User } from '../db/models';
+import { ACCESS_COOKIE } from '../modules/auth/session.service';
 
 const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' });
 
@@ -22,15 +23,15 @@ export class WebSocketGateway {
       '/ws',
       { websocket: true },
       async (socket, request) => {
-        // Browsers can't set Authorization headers on a WS handshake, so the JWT
-        // arrives as a query param: ws://host/ws?token=<jwt>. Verify it here.
+        // The browser sends the short-lived HttpOnly access cookie with the
+        // handshake. Keeping tokens out of the query string prevents accidental
+        // disclosure through access logs, browser history and proxy telemetry.
         let workspaceId: string | undefined;
         let userId: string | undefined;
         let role: string | undefined;
         let tokenVersion: number | undefined;
         try {
-          const url = new URL(request.url, 'http://localhost');
-          const token = url.searchParams.get('token');
+          const token = request.cookies[ACCESS_COOKIE];
           if (token) {
             const decoded = fastify.jwt.verify(token) as { workspaceId?: string; sub?: string; role?: string; tokenVersion?: number };
             workspaceId = decoded.workspaceId;
@@ -54,8 +55,8 @@ export class WebSocketGateway {
         // socket (or a freshly-opened one with their old token) kept receiving
         // workspace-wide events — including full message content — for up to 30 days.
         if (userId) {
-          const current = await User.findById(userId).select('tokenVersion isActive').lean();
-          if (!current || (current.tokenVersion ?? 0) !== (tokenVersion ?? 0) || current.isActive === false) {
+          const current = await User.findById(userId).select('tokenVersion isActive workspaceId').lean();
+          if (!current || current.workspaceId.toString() !== workspaceId || (current.tokenVersion ?? 0) !== (tokenVersion ?? 0) || current.isActive === false) {
             socket.close(1008, 'Unauthorized');
             return;
           }

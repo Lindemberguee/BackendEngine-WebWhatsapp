@@ -10,6 +10,7 @@ import { clearSlaTimers } from '../modules/routing/sla.service';
 import { normalizeNodes, normalizeEdges, nodeById, nextNodeId, entryNode } from './graph';
 import { buildMessageContent, interpolate, type FlowContext } from './senders';
 import { isPublicHttpUrl } from '../shared/url-security';
+import { fetchPublicUrl } from '../shared/public-fetch';
 import type { AnyMessageContent } from '@webwhatsapp/engine';
 import type { WebSocketGateway } from '../ws/gateway';
 
@@ -877,7 +878,7 @@ export class FlowRunner {
           continue;
         }
         try {
-          const res = await fetch(resolvedUrl, {
+          const res = await fetchPublicUrl(resolvedUrl, {
             method: httpMethod,
             headers: { 'Content-Type': 'application/json', ...(headers ?? {}) },
             body: ['GET', 'HEAD'].includes(httpMethod) ? undefined : interpolate(String(body ?? ''), ctx),
