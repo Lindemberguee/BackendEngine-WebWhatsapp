@@ -100,17 +100,18 @@ const fastify = Fastify({
   },
 });
 
-// Decodes (never verifies) a Bearer JWT's payload to pull out `sub`, purely to key
-// rate-limit buckets per-user instead of per-raw-header. Any malformed/non-JWT input
-// just falls through to `undefined` (caller falls back to IP).
-function decodeJwtSubUnsafe(authHeader: string): string | undefined {
-  const token = authHeader.replace(/^Bearer\s+/i, '');
-  const parts = token.split('.');
-  if (parts.length !== 3) return undefined;
+// Only signed credentials receive a per-user quota. Cookie parsing runs onRequest.
+function rateLimitSubject(request: import('fastify').FastifyRequest): string | undefined {
+  if (/\/api\/auth\/(login|register|forgot-password)\/?$/.test(request.routeOptions.url ?? '')) return undefined;
+  const authorization = request.headers.authorization;
+  const token = authorization
+    ? authorization.replace(/^Bearer\s+/i, '')
+    : request.cookies?.[ACCESS_COOKIE];
+  if (!token) return undefined;
   try {
-    const payloadJson = Buffer.from(parts[1], 'base64url').toString('utf8');
-    const payload = JSON.parse(payloadJson) as { sub?: unknown };
-    return typeof payload.sub === 'string' ? payload.sub : undefined;
+    const payload = fastify.jwt.verify<{ sub?: unknown; workspaceId?: unknown }>(token);
+    return typeof payload.sub === 'string' && typeof payload.workspaceId === 'string'
+      ? `user:${payload.workspaceId}:${payload.sub}` : undefined;
   } catch {
     return undefined;
   }
@@ -159,18 +160,12 @@ async function bootstrap(): Promise<void> {
   // Authenticated traffic also gets a higher ceiling than anonymous, since legitimate
   // polling/integration traffic is naturally heavier than anonymous requests.
   await fastify.register(rateLimit, {
-    max: (request: import('fastify').FastifyRequest) => (request.headers.authorization ? 600 : 100),
+    hook: 'preHandler',
+    max: (request: import('fastify').FastifyRequest) =>
+      (rateLimitSubject(request) || request.headers.authorization?.startsWith('Bearer wsk_') ? 600 : 100),
     timeWindow: '1 minute',
     keyGenerator: (request: import('fastify').FastifyRequest) => {
-      const auth = request.headers.authorization;
-      if (!auth) return request.ip;
-      // Key by the token's subject, not a hash of the raw header — a hash means
-      // every request with a random/garbage Authorization value gets its own
-      // fresh bucket, trivially bypassing the limit. Decoding (not verifying)
-      // the JWT payload is enough for a rate-limit key; signature validity is
-      // irrelevant here since we're not authenticating, just bucketing.
-      const sub = decodeJwtSubUnsafe(auth);
-      return sub ?? request.ip;
+      return rateLimitSubject(request) ?? `ip:${request.ip}`;
     },
     allowList: process.env.NODE_ENV !== 'production' ? ['127.0.0.1', '::1'] : [],
   });
