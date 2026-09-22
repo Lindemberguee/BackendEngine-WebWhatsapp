@@ -1,9 +1,12 @@
 import { Types } from 'mongoose';
+import pino from 'pino';
 import { Flow, FlowRun, Conversation } from '../db/models';
 import type { AnyMessageContent, WAMessage } from '@webwhatsapp/engine';
 import { FlowRunner, type RunnerDeps } from './runner';
 import type { FlowContext } from './senders';
 import type { WebSocketGateway } from '../ws/gateway';
+
+const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' });
 
 export { FlowRunner } from './runner';
 
@@ -87,7 +90,18 @@ export async function handleInboundForFlows(params: InboundParams): Promise<void
   // 'human'). Fetched once up front and reused for both gates below.
   const convState = await Conversation.findById(convId).select('assignedAgentId attendanceMode').lean();
   const humanEngaged = Boolean(convState?.assignedAgentId) || convState?.attendanceMode === 'human';
-  if (humanEngaged) return;
+  if (humanEngaged) {
+    // The #1 "meu fluxo não dispara" report: a conversation reused from earlier
+    // testing (manually assigned, or left in attendanceMode 'human') silently
+    // blocks every future trigger for that same contact, forever, with nothing
+    // in the UI or logs to explain why. Log it so this is diagnosable without
+    // having to read the conversation doc by hand.
+    logger.info(
+      { conversationId: convId, assignedAgentId: convState?.assignedAgentId, attendanceMode: convState?.attendanceMode },
+      '[flow] mensagem ignorada — conversa já está com um humano (atribuída ou attendanceMode=human)'
+    );
+    return;
+  }
 
   // 1) Try to resume a run waiting on this conversation.
   const waitingRun = await FlowRun.findOne({ conversationId: convId, status: 'waiting' }).sort({ updatedAt: -1 });
@@ -118,7 +132,10 @@ export async function handleInboundForFlows(params: InboundParams): Promise<void
 
   // 2) Don't start a new flow if one is already actively running.
   const active = await FlowRun.exists({ conversationId: convId, status: 'running' });
-  if (active) return;
+  if (active) {
+    logger.info({ conversationId: convId, runId: active._id }, '[flow] mensagem ignorada — já existe uma execução "running" para esta conversa');
+    return;
+  }
 
   // 3) Trigger matching. Keyword flows take precedence; an "any_message" catch-all
   //    flow is the fallback so an idle/finished conversation is never left
@@ -171,7 +188,18 @@ export async function handleInboundForFlows(params: InboundParams): Promise<void
     : undefined;
 
   const match = keywordMatch ?? newContactMatch ?? catchAll;
-  if (!match) return;
+  if (!match) {
+    // Silent before this log: no candidate flow was even a "trigger.type" match
+    // for this instance/group scope, or none of their keywords matched this
+    // text — most often an unpublished flow (enabled:false never shows up in
+    // the `flows` query above at all) or a keyword typo, and both looked
+    // identical to "nothing happened" from the outside.
+    logger.info(
+      { conversationId: convId, instanceId, text: lower.slice(0, 200), candidateFlows: flows.map((f) => ({ id: f._id, name: f.name, triggerType: f.trigger?.type, keywords: f.trigger?.keywords })) },
+      '[flow] nenhum gatilho correspondeu — verifique se o fluxo está publicado (enabled) e as palavras-chave'
+    );
+    return;
+  }
 
   // A fresh trigger matched — cancel a lingering waiting run so it can't resurface.
   if (waitingRun) {
@@ -180,6 +208,7 @@ export async function handleInboundForFlows(params: InboundParams): Promise<void
 
   const flowDoc = await Flow.findById(match._id);
   if (!flowDoc) return;
+  logger.info({ conversationId: convId, flowId: flowDoc._id, flowName: flowDoc.name, triggerType: match.trigger?.type }, '[flow] gatilho correspondeu — iniciando execução');
   await runner.start(flowDoc, {
     workspaceId, instanceId, conversationId: convId, jid: conversation.jid,
     contact, triggerMessageId: msg.key?.id ?? undefined, lastText: text, lastInboundKey: inboundKey,
