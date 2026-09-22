@@ -13,10 +13,25 @@ function hashRefreshToken(token: string): string {
 }
 
 function cookieOptions(maxAge: number) {
+  // The frontend and this API are on different registrable domains today
+  // (e.g. a Vercel preview/production domain talking to api.<ourdomain>), which
+  // makes every request — including the WS gateway's handshake — cross-site.
+  // SameSite=Lax cookies are never attached to a cross-site subresource request
+  // (fetch or WebSocket), only to a top-level navigation, so the WS handshake
+  // reached the server with no cookie at all and got closed as unauthorized
+  // every time. SameSite=None is the standard fix for a split-domain SPA+API —
+  // it requires Secure (HTTPS, already the case in production) and is safe
+  // here because CORS is locked to an explicit origin allowlist with
+  // credentials (see server.ts), not a wildcard: an arbitrary third-party site
+  // can't complete the CORS preflight to ride this cookie, which is the actual
+  // CSRF gate. Left as Lax outside production, where Secure (and therefore
+  // None) isn't available and everything runs same-origin on localhost anyway.
+  const secure = process.env.NODE_ENV === 'production';
+  const sameSite: 'none' | 'lax' = secure ? 'none' : 'lax';
   return {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax' as const,
+    secure,
+    sameSite,
     path: '/',
     maxAge,
     ...(process.env.AUTH_COOKIE_DOMAIN ? { domain: process.env.AUTH_COOKIE_DOMAIN } : {}),
