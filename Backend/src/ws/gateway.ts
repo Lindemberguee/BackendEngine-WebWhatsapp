@@ -38,6 +38,18 @@ export class WebSocketGateway {
             userId = decoded.sub;
             role = decoded.role;
             tokenVersion = decoded.tokenVersion;
+          } else {
+            // Silent before this log: the handshake reached us with no ACCESS_COOKIE
+            // at all — most often the frontend origin and this API aren't same-site
+            // (SameSite=Lax cookies aren't attached to a cross-site request, WebSocket
+            // handshakes included, even though a same-page fetch to the same API can
+            // still work if it was issued differently) or the cookie's `Secure` flag
+            // blocked it because the handshake went out as ws:// instead of wss://.
+            // `origin` below is the fastest way to tell which.
+            logger.warn(
+              { origin: request.headers.origin, hasCookieHeader: Boolean(request.headers.cookie) },
+              '[WS] Handshake sem cookie de acesso — provável origem cross-site ou ws:// em vez de wss://'
+            );
           }
         } catch (err) {
           logger.warn({ err }, '[WS] Token verification failed');
