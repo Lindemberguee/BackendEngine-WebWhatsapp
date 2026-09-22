@@ -23,15 +23,23 @@ export class WebSocketGateway {
       '/ws',
       { websocket: true },
       async (socket, request) => {
-        // The browser sends the short-lived HttpOnly access cookie with the
-        // handshake. Keeping tokens out of the query string prevents accidental
-        // disclosure through access logs, browser history and proxy telemetry.
+        // Prefer the short-lived HttpOnly access cookie — it needs nothing from
+        // the client beyond just connecting. Fall back to a `?ticket=` query
+        // param (a 30s single-purpose token, see issueWsTicket()) for the cases
+        // where the cookie never arrives at all: strict third-party-cookie
+        // blocking, a stale cookie issued before SameSite=None existed, a proxy
+        // that strips cookies on upgrade requests, etc. The ticket is fetched
+        // by the client over an already-cookie-authenticated REST call, so it
+        // doesn't reintroduce a long-lived credential into JS/the URL — same
+        // reasoning as why the real session JWT was moved out of the query
+        // string in the first place.
         let workspaceId: string | undefined;
         let userId: string | undefined;
         let role: string | undefined;
         let tokenVersion: number | undefined;
         try {
-          const token = request.cookies[ACCESS_COOKIE];
+          const query = request.query as { ticket?: string } | undefined;
+          const token = request.cookies[ACCESS_COOKIE] || query?.ticket;
           if (token) {
             const decoded = fastify.jwt.verify(token) as { workspaceId?: string; sub?: string; role?: string; tokenVersion?: number };
             workspaceId = decoded.workspaceId;
@@ -39,16 +47,18 @@ export class WebSocketGateway {
             role = decoded.role;
             tokenVersion = decoded.tokenVersion;
           } else {
-            // Silent before this log: the handshake reached us with no ACCESS_COOKIE
-            // at all — most often the frontend origin and this API aren't same-site
-            // (SameSite=Lax cookies aren't attached to a cross-site request, WebSocket
-            // handshakes included, even though a same-page fetch to the same API can
-            // still work if it was issued differently) or the cookie's `Secure` flag
-            // blocked it because the handshake went out as ws:// instead of wss://.
-            // `origin` below is the fastest way to tell which.
+            // Silent before this log: the handshake reached us with neither the
+            // cookie nor a ticket — most often the frontend origin and this API
+            // aren't same-site (SameSite=Lax cookies aren't attached to a
+            // cross-site request, WebSocket handshakes included) or the
+            // cookie's `Secure` flag blocked it because the handshake went out
+            // as ws:// instead of wss://. `origin` below is the fastest way to
+            // tell which — though with the ticket fallback in place this
+            // should now be rare (it only fires if the client's ticket fetch
+            // itself failed too).
             logger.warn(
-              { origin: request.headers.origin, hasCookieHeader: Boolean(request.headers.cookie) },
-              '[WS] Handshake sem cookie de acesso — provável origem cross-site ou ws:// em vez de wss://'
+              { origin: request.headers.origin, hasCookieHeader: Boolean(request.headers.cookie), hasTicket: Boolean(query?.ticket) },
+              '[WS] Handshake sem cookie de acesso nem ticket — provável origem cross-site ou ws:// em vez de wss://'
             );
           }
         } catch (err) {

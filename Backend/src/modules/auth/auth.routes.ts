@@ -8,7 +8,7 @@ import { notify } from '../notifications/notification.service';
 import type { WebSocketGateway } from '../../ws/gateway';
 import { Avatar } from '../../db/models';
 import { safeEqual } from '../../shared/crypto';
-import { clearSessionCookies, issueSession, refreshSession, revokeAllUserSessions, revokeSession } from './session.service';
+import { clearSessionCookies, issueSession, issueWsTicket, refreshSession, revokeAllUserSessions, revokeSession } from './session.service';
 
 function toMeResponse(user: NonNullable<Awaited<ReturnType<typeof getUserById>>>) {
   return {
@@ -90,6 +90,14 @@ export async function authRoutes(fastify: FastifyInstance, opts: { wsGateway: We
       return reply.status(401).send({ error: 'Sessão expirada — faça login novamente' });
     }
     return reply.send({ ok: true });
+  });
+
+  // POST /api/auth/ws-ticket  (requires auth) — mints a 30s single-purpose token
+  // for the WS handshake, fetched over this already-cookie-authenticated call
+  // and passed as ?ticket= instead. See issueWsTicket() for why this exists.
+  fastify.post('/ws-ticket', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+    const { sub, workspaceId, role, tokenVersion } = request.user as { sub: string; workspaceId: string; role: string; tokenVersion?: number };
+    return reply.send({ ticket: issueWsTicket(fastify, { sub, workspaceId, role, tokenVersion }) });
   });
 
   // GET /api/auth/me  (requires auth)

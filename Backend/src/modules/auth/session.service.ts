@@ -7,6 +7,7 @@ export const ACCESS_COOKIE = 'ww_access';
 export const REFRESH_COOKIE = 'ww_refresh';
 const ACCESS_TTL_SECONDS = 15 * 60;
 const REFRESH_TTL_SECONDS = 30 * 24 * 60 * 60;
+const WS_TICKET_TTL_SECONDS = 30;
 
 function hashRefreshToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
@@ -46,6 +47,32 @@ function setSessionCookies(reply: FastifyReply, accessToken: string, refreshToke
 export function clearSessionCookies(reply: FastifyReply): void {
   reply.clearCookie(ACCESS_COOKIE, cookieOptions(0));
   reply.clearCookie(REFRESH_COOKIE, cookieOptions(0));
+}
+
+/**
+ * Short-lived (30s), single-purpose credential for the WS handshake — a
+ * fallback for when the ACCESS_COOKIE never reaches the gateway at all.
+ *
+ * The gateway can't rely solely on the cookie: SameSite=None/Secure covers
+ * the common split-domain case (see cookieOptions above), but a browser or
+ * network path that still drops it (strict third-party-cookie blocking, a
+ * stale cookie from before this attribute existed, a corporate proxy) leaves
+ * the handshake with nothing to authenticate against and no way to recover
+ * short of a full re-login. This ticket is fetched over an already-cookie-
+ * authenticated REST call (proven to work, since every other API call does)
+ * and passed as `?ticket=` on the WS URL instead — query strings aren't
+ * subject to any cookie policy at all. It intentionally is NOT the real
+ * session JWT: 30s of validity bounds the blast radius of it ever leaking
+ * into a proxy/access log, unlike a 15-minute access token.
+ */
+export function issueWsTicket(
+  fastify: FastifyInstance,
+  claims: { sub: string; workspaceId: string; role: string; tokenVersion?: number },
+): string {
+  return fastify.jwt.sign(
+    { sub: claims.sub, workspaceId: claims.workspaceId, role: claims.role, tokenVersion: claims.tokenVersion ?? 0 },
+    { expiresIn: WS_TICKET_TTL_SECONDS },
+  );
 }
 
 export async function issueSession(
