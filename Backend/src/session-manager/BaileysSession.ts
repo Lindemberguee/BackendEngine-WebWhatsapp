@@ -1,5 +1,6 @@
 import makeWASocket, {
   DisconnectReason,
+  fetchLatestBaileysVersion,
   type WASocket,
   type AnyMessageContent,
   type WAMessage,
@@ -23,6 +24,43 @@ import type { IChannelSession } from '../channels/types';
 import { archiveMessageMedia } from '../shared/media-storage';
 
 const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' });
+
+// A stale pinned WA Web version is the single most common cause of a Baileys
+// session that never stabilizes: WhatsApp's servers accept the handshake/QR
+// scan and then silently drop the connection moments later with a generic
+// (non-loggedOut/forbidden/badSession) close — which the reconnect ladder
+// below treats as transient, builds a brand-new socket on that same stale
+// version, and repeats. From the outside that reads as the instance being
+// stuck "fica em loop procurando conexão" forever instead of ever reaching
+// `open`. Resolve the current version once per process (cheap fetch against
+// GitHub; falls back to the engine's own bundled version.json on failure and
+// never throws) and reuse it for every (re)connect instead of letting
+// makeWASocket() default to whatever version shipped with the engine.
+let cachedBaileysVersion: [number, number, number] | undefined;
+let baileysVersionFetchedAt = 0;
+const BAILEYS_VERSION_TTL_MS = 6 * 60 * 60_000;
+
+async function resolveBaileysVersion(): Promise<[number, number, number] | undefined> {
+  if (cachedBaileysVersion && Date.now() - baileysVersionFetchedAt < BAILEYS_VERSION_TTL_MS) {
+    return cachedBaileysVersion;
+  }
+  try {
+    // Bound the network round-trip — fetchLatestBaileysVersion() awaits a plain
+    // fetch() with no timeout of its own, and a stalled connection here (blocked
+    // egress to GitHub, DNS hang) would otherwise stall every connectSocket()
+    // call on this instead of falling back to the cached/bundled version.
+    const { version, isLatest, error } = await fetchLatestBaileysVersion({ signal: AbortSignal.timeout(5000) });
+    cachedBaileysVersion = version as [number, number, number];
+    baileysVersionFetchedAt = Date.now();
+    if (!isLatest) logger.warn({ version, error }, '[baileys] usando versão de fallback embutida (falha ao checar a mais recente)');
+    return cachedBaileysVersion;
+  } catch (err) {
+    // fetchLatestBaileysVersion already falls back internally and shouldn't
+    // throw — but never let a version-pin failure block connecting outright.
+    logger.warn({ err }, '[baileys] falha ao resolver versão — seguindo sem pin explícito');
+    return cachedBaileysVersion;
+  }
+}
 
 /**
  * Strip the device/agent suffix from a JID so the same user coming from a linked
@@ -100,11 +138,15 @@ export class BaileysSession implements IChannelSession {
     this.wsGateway.broadcastInstanceStatus(this.workspaceId, this.instanceId, 'connecting');
 
     await this.flushAuthWrites();
-    const { state, saveCreds, flushWrites } = await useMongoAuthState(this.instanceId, () => !this.destroyed && this.generation === generation);
+    const [{ state, saveCreds, flushWrites }, version] = await Promise.all([
+      useMongoAuthState(this.instanceId, () => !this.destroyed && this.generation === generation),
+      resolveBaileysVersion(),
+    ]);
     this.flushAuthWrites = flushWrites;
     if (this.destroyed || this.generation !== generation) return;
 
     this.sock = makeWASocket({
+      ...(version ? { version } : {}),
       auth: {
         creds: state.creds,
         keys: makeCacheableSignalKeyStore(state.keys, logger as unknown as Parameters<typeof makeCacheableSignalKeyStore>[1]),
