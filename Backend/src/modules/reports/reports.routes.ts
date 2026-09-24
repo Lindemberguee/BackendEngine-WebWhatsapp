@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import ExcelJS from 'exceljs';
-import { resolveDateRange, isoDate } from '../../shared/date-range';
+import { reportRange, reportDay, reportExcelDate } from './report-period';
 import { buildReportSummary, findReportConversations, type ReportRow, type CloseReasonRow } from './reports.service';
 import { clampAnalyticsFrom } from '../billing/billing.service';
 
@@ -21,10 +21,11 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
     if (!requireManager(role, reply)) return;
 
     const q = request.query as Record<string, string>;
-    const { from: requestedFrom, to } = resolveDateRange(q);
+    const { from: requestedFrom, to } = reportRange(q);
     const from = await clampAnalyticsFrom(workspaceId, requestedFrom);
+    if (from > to) return reply.status(400).send({ error: 'Periodo indisponivel no historico do plano.' });
     const summary = await buildReportSummary({ workspaceId, from, to, teamGroupId: q.teamGroupId, agentId: q.agentId });
-    return reply.send({ data: summary });
+    return reply.header('Cache-Control', 'private, no-store').send({ data: summary });
   });
 
   // GET /api/reports/export — generates a multi-sheet .xlsx workbook for the same filters.
@@ -33,8 +34,9 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
     if (!requireManager(role, reply)) return;
 
     const q = request.query as Record<string, string>;
-    const { from: requestedFrom, to } = resolveDateRange(q);
+    const { from: requestedFrom, to } = reportRange(q);
     const from = await clampAnalyticsFrom(workspaceId, requestedFrom);
+    if (from > to) return reply.status(400).send({ error: 'Periodo indisponivel no historico do plano.' });
     const filters = { workspaceId, from, to, teamGroupId: q.teamGroupId, agentId: q.agentId };
 
     const [summary, conversations] = await Promise.all([
@@ -50,13 +52,13 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
     const summarySheet = workbook.addWorksheet('Resumo');
     summarySheet.columns = [{ header: 'Métrica', key: 'metric', width: 32 }, { header: 'Valor', key: 'value', width: 16 }];
     summarySheet.addRows([
-      { metric: 'Período (de)', value: isoDate(from) },
-      { metric: 'Período (até)', value: isoDate(to) },
+      { metric: 'Periodo (de, Sao Paulo)', value: reportExcelDate(from) },
+      { metric: 'Periodo (ate, Sao Paulo)', value: reportExcelDate(to) },
       { metric: 'Conversas criadas no período', value: summary.overview.totalCreated },
       { metric: 'Conversas abertas (atual)', value: summary.overview.openNow },
       { metric: 'Conversas finalizadas no período', value: summary.overview.resolvedInRange },
       { metric: 'Conversas com contato bloqueado', value: summary.overview.blocked },
-      { metric: 'Taxa de resolução (%)', value: summary.overview.resolutionRate },
+      { metric: 'Saidas / entradas (%)', value: summary.overview.totalCreated ? summary.overview.resolutionRate : null },
       { metric: 'Tempo médio 1ª resposta (min)', value: summary.overview.avgFirstResponseMinutes ?? '—' },
       { metric: 'SLA 1ª resposta estourado (%)', value: summary.overview.slaFirstResponseBreachRate },
       { metric: 'SLA resolução estourado (%)', value: summary.overview.slaResolutionBreachRate },
@@ -67,6 +69,15 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
       { metric: 'Avaliações recebidas', value: summary.csat.count },
     ]);
     summarySheet.getRow(1).font = { bold: true };
+    summarySheet.getColumn('metric').width = 42;
+    summarySheet.getColumn('value').width = 24;
+    summarySheet.eachRow((row, index) => {
+      if (index === 2 || index === 3) row.getCell(2).numFmt = 'dd/mm/yyyy hh:mm:ss';
+      if (String(row.getCell(1).value).includes('(%)') && typeof row.getCell(2).value === 'number') {
+        row.getCell(2).value = Number(row.getCell(2).value) / 100;
+        row.getCell(2).numFmt = '0.0%';
+      }
+    });
 
     // ── Tendência Diária ──────────────────────────────────────────────────────
     const trendSheet = workbook.addWorksheet('Tendência Diária');
@@ -75,7 +86,8 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
       { header: 'Criadas', key: 'created', width: 12 },
       { header: 'Finalizadas', key: 'resolved', width: 14 },
     ];
-    trendSheet.addRows(summary.trend);
+    trendSheet.addRows(summary.trend.map((row) => ({ ...row, date: new Date(`${row.date}T00:00:00Z`) })));
+    trendSheet.getColumn('date').numFmt = 'dd/mm/yyyy';
     trendSheet.getRow(1).font = { bold: true };
 
     // ── Por Equipe / Por Atendente (shared shape) ────────────────────────────
@@ -87,9 +99,10 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
         { header: 'Finalizadas', key: 'resolved', width: 14 },
         { header: 'Abertas (atual)', key: 'open', width: 16 },
         { header: 'Bloqueadas', key: 'blocked', width: 14 },
-        { header: 'Taxa resolução (%)', key: 'resolutionRate', width: 18 },
+        { header: 'Saidas / entradas', key: 'resolutionRate', width: 20 },
       ];
-      sheet.addRows(rows.map((r) => ({ name: r.name, total: r.total, resolved: r.resolved, open: r.open, blocked: r.blocked, resolutionRate: r.resolutionRate })));
+      sheet.addRows(rows.map((r) => ({ name: r.name, total: r.total, resolved: r.resolved, open: r.open, blocked: r.blocked, resolutionRate: r.total ? r.resolutionRate / 100 : null })));
+      sheet.getColumn('resolutionRate').numFmt = '0.0%';
       sheet.getRow(1).font = { bold: true };
     }
     addBreakdownSheet('Por Equipe', 'Equipe', summary.byTeam);
@@ -98,13 +111,17 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
     // ── Satisfação (CSAT) ─────────────────────────────────────────────────────
     const csatSheet = workbook.addWorksheet('Satisfação');
     csatSheet.columns = [{ header: 'Nota', key: 'label', width: 24 }, { header: 'Avaliações', key: 'count', width: 14 }];
-    csatSheet.addRows(summary.csat.distribution.map((d) => ({ label: `${d.score} estrela${d.score > 1 ? 's' : ''}`, count: d.count })));
-    csatSheet.addRow({});
-    csatSheet.addRow({ label: 'Por atendente', count: '' }).font = { bold: true };
-    csatSheet.addRows(summary.csat.byAgent.map((a) => ({ label: a.name, count: `${a.average} (${a.count} avaliações)` })));
-    csatSheet.addRow({});
-    csatSheet.addRow({ label: 'Por equipe', count: '' }).font = { bold: true };
-    csatSheet.addRows(summary.csat.byTeam.map((t) => ({ label: t.name, count: `${t.average} (${t.count} avaliações)` })));
+    csatSheet.addRows(summary.csat.distribution.map((d) => ({ label: d.score, count: d.count })));
+    for (const [name, rows] of [['CSAT por Atendente', summary.csat.byAgent], ['CSAT por Equipe', summary.csat.byTeam]] as const) {
+      const sheet = workbook.addWorksheet(name);
+      sheet.columns = [
+        { header: 'Nome', key: 'name', width: 30 },
+        { header: 'Media', key: 'average', width: 14 },
+        { header: 'Avaliacoes', key: 'count', width: 14 },
+      ];
+      sheet.addRows(rows);
+      sheet.getColumn('average').numFmt = '0.0';
+    }
     csatSheet.getRow(1).font = { bold: true };
 
     // ── Motivos de Encerramento ───────────────────────────────────────────────
@@ -126,6 +143,11 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
     // ── Conversas (detalhado) ─────────────────────────────────────────────────
     const detailSheet = workbook.addWorksheet('Conversas');
     detailSheet.columns = [
+      { header: 'ID', key: 'id', width: 26 },
+      { header: 'Criada no periodo', key: 'createdInPeriod', width: 20 },
+      { header: 'Finalizada no periodo', key: 'resolvedInPeriod', width: 24 },
+      { header: 'Aberta agora', key: 'openNow', width: 18 },
+      { header: 'Bloqueada no periodo', key: 'blockedInPeriod', width: 24 },
       { header: 'Nome', key: 'name', width: 24 },
       { header: 'Telefone', key: 'phone', width: 16 },
       { header: 'Status', key: 'status', width: 12 },
@@ -139,16 +161,52 @@ export async function reportsRoutes(fastify: FastifyInstance): Promise<void> {
     ];
     detailSheet.addRows(conversations.map((c) => ({
       ...c,
+      createdInPeriod: Number(c.createdInPeriod),
+      resolvedInPeriod: Number(c.resolvedInPeriod),
+      openNow: Number(c.openNow),
+      blockedInPeriod: Number(c.blockedInPeriod),
       blocked: c.blocked ? 'Sim' : 'Não',
-      createdAt: c.createdAt ? new Date(c.createdAt).toLocaleString('pt-BR') : '',
-      resolvedAt: c.resolvedAt ? new Date(c.resolvedAt).toLocaleString('pt-BR') : '',
+      createdAt: c.createdAt ? reportExcelDate(new Date(c.createdAt)) : null,
+      resolvedAt: c.resolvedAt ? reportExcelDate(new Date(c.resolvedAt)) : null,
     })));
     detailSheet.getRow(1).font = { bold: true };
+    detailSheet.getColumn('createdAt').numFmt = 'dd/mm/yyyy hh:mm:ss';
+    detailSheet.getColumn('resolvedAt').numFmt = 'dd/mm/yyyy hh:mm:ss';
+    detailSheet.getColumn('phone').numFmt = '@';
+
+    const criteria = workbook.addWorksheet('Criterios');
+    criteria.columns = [{ header: 'Campo', key: 'field', width: 28 }, { header: 'Valor', key: 'value', width: 100 }];
+    criteria.addRows([
+      { field: 'Fuso horario', value: 'America/Sao_Paulo. Datas do Excel representam o horario local.' },
+      { field: 'Gerado em', value: reportExcelDate(workbook.created) },
+      { field: 'Equipe (ID)', value: q.teamGroupId || 'Todas' },
+      { field: 'Atendente (ID)', value: q.agentId || 'Todos' },
+      { field: 'Criadas', value: 'Data de criacao dentro do periodo efetivo informado no Resumo.' },
+      { field: 'Finalizadas', value: 'Status atual finalizado e data de resolucao no periodo; inclui conversas criadas antes.' },
+      { field: 'Abertas', value: 'Status aberto no momento da consulta, sem restricao de data de criacao.' },
+      { field: 'Bloqueadas', value: 'Criadas no periodo cujo contato esta bloqueado no momento da consulta.' },
+      { field: 'Saidas / entradas', value: 'Finalizadas dividido por criadas. Pode superar 100%; vazio quando nao ha entradas.' },
+      { field: 'Conversas detalhadas', value: 'Uniao dos grupos acima. Colunas 1/0 identificam quais totais cada conversa compoe.' },
+      { field: 'Atendimento e SLA', value: 'Estado atual das conversas criadas no periodo. SLA usa todas as criadas como denominador.' },
+      { field: 'CSAT', value: 'Avaliacoes recebidas no periodo, filtradas pela equipe e atendente da avaliacao.' },
+      { field: 'Atualizacao', value: 'Dados consultados durante a geracao; operacoes simultaneas podem alterar os totais entre consultas.' },
+    ]);
+    criteria.getCell('B3').numFmt = 'dd/mm/yyyy hh:mm:ss';
+    for (const sheet of workbook.worksheets) {
+      sheet.views = [{ state: 'frozen', ySplit: 1 }];
+      sheet.autoFilter = { from: { row: 1, column: 1 }, to: { row: 1, column: sheet.columnCount } };
+      sheet.getRow(1).height = 28;
+      sheet.getRow(1).eachCell((cell) => {
+        cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF185D63' } };
+      });
+    }
 
     const buffer = await workbook.xlsx.writeBuffer();
     reply
       .header('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-      .header('Content-Disposition', `attachment; filename="relatorio-${isoDate(from)}-a-${isoDate(to)}.xlsx"`)
+      .header('Content-Disposition', `attachment; filename="relatorio-${reportDay(from)}-a-${reportDay(to)}.xlsx"`)
+      .header('Cache-Control', 'private, no-store')
       .send(Buffer.from(buffer));
   });
 }

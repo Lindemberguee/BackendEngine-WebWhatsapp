@@ -1,6 +1,7 @@
 import { Types } from 'mongoose';
 import { Conversation, TeamGroup, User, CloseReason, Rating } from '../../db/models';
-import { addDays, daysBetween, emptyDailyBuckets } from '../../shared/date-range';
+import { emptyDailyBuckets } from '../../shared/date-range';
+import { reportDay } from './report-period';
 
 export interface ReportFilters {
   workspaceId: string;
@@ -183,9 +184,9 @@ export async function buildReportSummary(filters: ReportFilters): Promise<Report
   if (agentId && Types.ObjectId.isValid(agentId)) ratingMatch.agentId = new Types.ObjectId(agentId);
 
   // Previous period of equal length, for the delta arrows on the KPI cards.
-  const span = Math.max(1, daysBetween(from, to));
-  const prevFrom = addDays(from, -span);
-  const prevTo = from;
+  const span = to.getTime() - from.getTime() + 1;
+  const prevFrom = new Date(from.getTime() - span);
+  const prevTo = new Date(from.getTime() - 1);
 
   const [
     createdByTeam, resolvedByTeam, openByTeam, blockedByTeam,
@@ -220,7 +221,7 @@ export async function buildReportSummary(filters: ReportFilters): Promise<Report
     // Bot vs. human vs. idle — current mode of conversations created in the period.
     Conversation.aggregate<{ _id: string | null; count: number }>([
       { $match: createdMatch },
-      { $group: { _id: '$attendanceMode', count: { $sum: 1 } } },
+      { $group: { _id: { $ifNull: ['$attendanceMode', 'idle'] }, count: { $sum: 1 } } },
     ]),
 
     // SLA breach rates — of conversations created in the period.
@@ -365,7 +366,7 @@ export async function buildReportSummary(filters: ReportFilters): Promise<Report
     .sort((a, b) => b.total - a.total);
 
   // Daily trend — fill every calendar day in range so gaps show as 0, not a missing point.
-  const trendBuckets = emptyDailyBuckets(from, to, ['created', 'resolved']);
+  const trendBuckets = emptyDailyBuckets(new Date(reportDay(from)), new Date(reportDay(to)), ['created', 'resolved']);
   for (const r of trendCreatedRows) { const b = trendBuckets[r._id]; if (b) b.created = r.count; }
   for (const r of trendResolvedRows) { const b = trendBuckets[r._id]; if (b) b.resolved = r.count; }
   const trend = Object.values(trendBuckets);
@@ -432,12 +433,19 @@ export async function buildReportSummary(filters: ReportFilters): Promise<Report
   };
 }
 
-/** Raw per-conversation rows for the export's detailed sheet — same filters,
- *  no pagination (this is a full-fidelity audit dump, not a paged list). */
+/** Union of the created, resolved and currently open cohorts, with explicit
+ *  flags so the workbook can reconcile each indicator independently. */
 export async function findReportConversations(filters: ReportFilters) {
   const { workspaceId, from, to, teamGroupId, agentId } = filters;
   const wsOid = new Types.ObjectId(workspaceId);
-  const match: Record<string, unknown> = { workspaceId: wsOid, createdAt: { $gte: from, $lte: to } };
+  const match: Record<string, unknown> = {
+    workspaceId: wsOid,
+    $or: [
+      { createdAt: { $gte: from, $lte: to } },
+      { status: 'resolved', resolvedAt: { $gte: from, $lte: to } },
+      { status: 'open' },
+    ],
+  };
   if (teamGroupId && Types.ObjectId.isValid(teamGroupId)) match.teamGroupId = new Types.ObjectId(teamGroupId);
   if (agentId && Types.ObjectId.isValid(agentId)) match.assignedAgentId = new Types.ObjectId(agentId);
 
@@ -445,17 +453,29 @@ export async function findReportConversations(filters: ReportFilters) {
     Conversation.find(match)
       .select('name phone status teamGroupId assignedAgentId tags contactId closeReasonId createdAt resolvedAt')
       .populate('contactId', 'status')
+      .sort({ createdAt: 1, _id: 1 })
+      .limit(50_001)
       .lean(),
     TeamGroup.find({ workspaceId: wsOid }).select('name').lean(),
     User.find({ workspaceId: wsOid }).select('name').lean(),
     CloseReason.find({ workspaceId: wsOid }).select('label').lean(),
   ]);
 
+  if (conversations.length > 50_000) {
+    throw Object.assign(new Error('A exportacao excede 50 mil conversas. Reduza o periodo ou filtre por equipe e atendente.'), { statusCode: 413 });
+  }
+
   const teamMap = new Map(teamGroups.map((t) => [t._id.toString(), t.name]));
   const userMap = new Map(users.map((u) => [u._id.toString(), u.name as string]));
   const reasonMap = new Map(closeReasonsDocs.map((r) => [r._id.toString(), r.label]));
 
+  const inRange = (date?: Date | null) => date != null && date >= from && date <= to;
   return conversations.map((c) => ({
+    id: c._id.toString(),
+    createdInPeriod: inRange(c.createdAt),
+    resolvedInPeriod: c.status === 'resolved' && inRange(c.resolvedAt),
+    openNow: c.status === 'open',
+    blockedInPeriod: inRange(c.createdAt) && (c.contactId as unknown as { status?: string } | null)?.status === 'blocked',
     name: c.name,
     phone: c.phone ?? '',
     status: c.status,
