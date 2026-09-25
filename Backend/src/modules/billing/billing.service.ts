@@ -1,3 +1,4 @@
+import { accountMembershipFilter } from '../auth/account.service';
 import { Subscription, Invoice, Workspace, Instance, User, Flow, Conversation, Pipeline } from '../../db/models';
 import type { ISubscription, BillingCycle } from '../../db/models';
 import { PLANS, getPlan, getPlanByTier, DEFAULT_TRIAL_TIER, TRIAL_DAYS, type PlanDefinition } from './plans.config';
@@ -28,14 +29,14 @@ export function listPlans(): PlanDefinition[] {
 
 // ── Subscription lifecycle ───────────────────────────────────────────────────
 
-/** Every workspace gets one on first read — a 14-day Pro trial, no card required. */
+/** Explicit provisioning only; read endpoints must not create trials. */
 export async function getOrCreateSubscription(workspaceId: string): Promise<ISubscription> {
   let sub = await Subscription.findOne({ workspaceId });
   if (sub) return sub;
 
   const trialPlan = getPlanByTier(DEFAULT_TRIAL_TIER)!;
   const now = new Date();
-  sub = await Subscription.create({
+  sub = await Subscription.findOneAndUpdate({ workspaceId }, { $setOnInsert: {
     workspaceId,
     planId: trialPlan.id,
     status: 'trialing',
@@ -43,7 +44,8 @@ export async function getOrCreateSubscription(workspaceId: string): Promise<ISub
     currentPeriodStart: now,
     currentPeriodEnd: addDays(now, TRIAL_DAYS),
     trialEndsAt: addDays(now, TRIAL_DAYS),
-  });
+  } }, { upsert: true, new: true });
+  if (!sub) throw new Error('Falha ao provisionar assinatura');
   await Workspace.updateOne({ _id: workspaceId }, { $set: { plan: trialPlan.tier } });
   return sub;
 }
@@ -116,7 +118,8 @@ export async function resumeSubscription(workspaceId: string): Promise<ISubscrip
 // ── Response shaping (matches the frontend's billing.types.ts contract) ─────
 
 export async function getSubscriptionResponse(workspaceId: string) {
-  const sub = await getOrCreateSubscription(workspaceId);
+  const sub = await Subscription.findOne({ workspaceId });
+  if (!sub) throw Object.assign(new Error('Assinatura não provisionada; contate o suporte'), { statusCode: 409 });
   const plan = getPlan(sub.planId) ?? getPlanByTier('starter')!;
   return {
     id: sub._id.toString(),
@@ -163,14 +166,14 @@ export function listPlansResponse() {
 }
 
 export async function getUsage(workspaceId: string) {
-  const sub = await getOrCreateSubscription(workspaceId);
-  const plan = getPlan(sub.planId) ?? getPlanByTier('starter')!;
+  const sub = await Subscription.findOne({ workspaceId });
+  const plan = getPlan(sub?.planId ?? '') ?? getPlanByTier('starter')!;
 
   const [instances, agents, activeAutomations, conversations] = await Promise.all([
     Instance.countDocuments({ workspaceId }),
     User.countDocuments({ workspaceId, isActive: true }),
     Flow.countDocuments({ workspaceId, enabled: true }),
-    Conversation.countDocuments({ workspaceId, createdAt: { $gte: sub.currentPeriodStart } }),
+    Conversation.countDocuments({ workspaceId, createdAt: { $gte: sub?.currentPeriodStart ?? new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), 1)) } }),
   ]);
 
   return [
@@ -184,17 +187,17 @@ export async function getUsage(workspaceId: string) {
 // ── Plan-limit enforcement — call before creating the resource ──────────────
 
 async function currentPlan(workspaceId: string): Promise<PlanDefinition> {
-  const sub = await getOrCreateSubscription(workspaceId);
-  return getPlan(sub.planId) ?? getPlanByTier('starter')!;
+  const sub = await Subscription.findOne({ workspaceId });
+  return getPlan(sub?.planId ?? '') ?? getPlanByTier('starter')!;
 }
 
 /** New conversations in the current billing period — createdAt, not
  *  updatedAt, so an old conversation getting a new message doesn't count
  *  again (it isn't a *new* conversation). */
 async function conversationsThisPeriod(workspaceId: string): Promise<{ count: number; plan: PlanDefinition }> {
-  const sub = await getOrCreateSubscription(workspaceId);
-  const plan = getPlan(sub.planId) ?? getPlanByTier('starter')!;
-  const count = await Conversation.countDocuments({ workspaceId, createdAt: { $gte: sub.currentPeriodStart } });
+  const sub = await Subscription.findOne({ workspaceId });
+  const plan = getPlan(sub?.planId ?? '') ?? getPlanByTier('starter')!;
+  const count = await Conversation.countDocuments({ workspaceId, createdAt: { $gte: sub?.currentPeriodStart ?? new Date(Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), 1)) } });
   return { count, plan };
 }
 
@@ -308,7 +311,9 @@ export async function assertCanCreatePipeline(workspaceId: string): Promise<void
  *  loophole where creating workspace after workspace kept minting fresh
  *  14-day Pro trials (getOrCreateSubscription never runs for a rejected create). */
 export async function assertCanCreateWorkspace(ownerId: string): Promise<void> {
-  const owned = await Workspace.find({ ownerId }).select('_id').lean();
+  const caller = await User.findById(ownerId).select('accountId').lean();
+  const ownerIds = caller ? await User.find(accountMembershipFilter(caller)).distinct('_id') : [ownerId];
+  const owned = await Workspace.find({ ownerId: { $in: ownerIds } }).select('_id').lean();
   if (owned.length === 0) return;
   const subs = await Subscription.find({ workspaceId: { $in: owned.map((w) => w._id) } }).lean();
   const anyMultiWorkspace = subs.some((s) => getPlan(s.planId)?.limits.multiWorkspace);

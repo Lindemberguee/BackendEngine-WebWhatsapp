@@ -1,5 +1,4 @@
 import { Types } from 'mongoose';
-import bcrypt from 'bcrypt';
 import { User, AuditLog } from '../../db/models';
 import type { IUser, UserRole, IUserStatus, UserAvailability } from '../../db/models';
 import { assertCanCreateAgent } from '../billing/billing.service';
@@ -48,35 +47,7 @@ export async function createAgent(
   data: { name?: string; email?: string; password?: string; role?: string },
   actor?: { id: string; name: string; email: string }
 ): Promise<TeamMember> {
-  const name = (data.name ?? '').trim();
-  const email = (data.email ?? '').toLowerCase().trim();
-  if (!name) throw new Error('Nome é obrigatório');
-  if (!EMAIL_RE.test(email)) throw new Error('E-mail inválido');
-  if (!data.password || data.password.length < 6) throw new Error('Senha deve ter ao menos 6 caracteres');
-  const role = ASSIGNABLE_ROLES.includes((data.role ?? '') as UserRole) ? (data.role as UserRole) : 'agent';
-
-  // Check uniqueness within the workspace
-  const existing = await User.findOne({ email, workspaceId: new Types.ObjectId(workspaceId) });
-  if (existing) throw new Error('E-mail já cadastrado neste workspace');
-
-  await assertCanCreateAgent(workspaceId);
-
-  const user = await User.create({
-    workspaceId: new Types.ObjectId(workspaceId),
-    name, email, passwordHash: data.password, role, isActive: true,
-  });
-
-  if (actor) {
-    await AuditLog.create({
-      workspaceId: new Types.ObjectId(workspaceId),
-      actor: { id: new Types.ObjectId(actor.id), name: actor.name, email: actor.email },
-      type: 'team.member_invited',
-      target: { type: 'user', id: user._id!.toString(), label: `${name} (${email})` },
-      metadata: { role },
-    }).catch(() => {});
-  }
-
-  return toTeamMember(user);
+  throw new Error('Use um convite com aceite autenticado para adicionar membros');
 }
 
 export async function updateAgent(
@@ -166,22 +137,7 @@ export async function resetAgentPassword(
   actorId: string,
   newPassword: string
 ): Promise<void> {
-  if (!newPassword || newPassword.length < 6) throw new Error('Senha deve ter ao menos 6 caracteres');
-  const user = await User.findOne({ _id: id, workspaceId: new Types.ObjectId(workspaceId) });
-  if (!user) throw new Error('Usuário não encontrado');
-  if (user._id!.toString() === actorId) throw new Error('Use o perfil para alterar sua própria senha');
-  // Same guard as updateAgent/removeAgent: without it, an admin can reset the
-  // owner's password and sign in as them — the one role update/removal can't touch.
-  if (user.role === 'owner') throw new Error('O proprietário não pode ser alterado');
-
-  // This account can be represented in more than one switchable workspace.
-  // Hash once and update every identity record so an old workspace record never
-  // preserves the previous password or a valid session.
-  const passwordHash = await bcrypt.hash(newPassword, 12);
-  await User.updateMany(
-    { email: user.email },
-    { $set: { passwordHash }, $inc: { tokenVersion: 1 } },
-  );
+  throw new Error('A senha pertence à conta pessoal. Apenas o titular pode alterá-la no perfil.');
 }
 
 const AVAILABILITY_VALUES: UserAvailability[] = ['available', 'busy', 'offline'];

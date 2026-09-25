@@ -1,9 +1,11 @@
+import { requireRole } from '../../utils/require-role';
 import type { FastifyInstance } from 'fastify';
 import { Types } from 'mongoose';
 import { QuickReply } from '../../db/models';
 
 export async function quickRepliesRoutes(fastify: FastifyInstance): Promise<void> {
   const auth = { preHandler: [fastify.authenticate] };
+  const canWrite = { preHandler: [fastify.authenticate, requireRole(['owner', 'admin', 'agent'])] };
 
   // GET /api/quick-replies — list workspace canned messages, alphabetical by title
   fastify.get('/', auth, async (request, reply) => {
@@ -15,7 +17,7 @@ export async function quickRepliesRoutes(fastify: FastifyInstance): Promise<void
   });
 
   // POST /api/quick-replies — create { title, content }
-  fastify.post('/', auth, async (request, reply) => {
+  fastify.post('/', canWrite, async (request, reply) => {
     const { workspaceId } = request.user as { workspaceId: string };
     const { title, content } = request.body as { title?: string; content?: string };
 
@@ -33,7 +35,7 @@ export async function quickRepliesRoutes(fastify: FastifyInstance): Promise<void
   });
 
   // PATCH /api/quick-replies/:id — edit { title?, content? }
-  fastify.patch('/:id', auth, async (request, reply) => {
+  fastify.patch('/:id', canWrite, async (request, reply) => {
     const { workspaceId } = request.user as { workspaceId: string };
     const { id } = request.params as { id: string };
     const { title, content } = request.body as { title?: string; content?: string };
@@ -56,7 +58,7 @@ export async function quickRepliesRoutes(fastify: FastifyInstance): Promise<void
   });
 
   // DELETE /api/quick-replies/:id
-  fastify.delete('/:id', auth, async (request, reply) => {
+  fastify.delete('/:id', canWrite, async (request, reply) => {
     const { workspaceId } = request.user as { workspaceId: string };
     const { id } = request.params as { id: string };
 

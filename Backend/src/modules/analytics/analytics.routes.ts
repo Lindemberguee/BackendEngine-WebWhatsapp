@@ -1,3 +1,4 @@
+import { parseAnalyticsRange } from './date-range';
 import type { FastifyInstance } from 'fastify';
 import { Types } from 'mongoose';
 import { Conversation, Message, Contact, Flow, FlowRun, Lead, Campaign } from '../../db/models';
@@ -60,21 +61,11 @@ export async function analyticsRoutes(fastify: FastifyInstance): Promise<void> {
     const q = request.query as Record<string, string>;
 
     // Resolve period
-    const now = new Date();
-    let from: Date;
-    let to: Date = now;
-    if (q.from && q.to) {
-      from = new Date(q.from);
-      to   = new Date(q.to);
-    } else if (q.period === 'today') {
-      from = startOfDay(now);
-    } else if (q.period === '30d') {
-      from = addDays(now, -30);
-    } else {
-      // default: 7d
-      from = addDays(now, -7);
-    }
+    let from: Date, to: Date;
+    try { ({ from, to } = parseAnalyticsRange(q)); }
+    catch (error) { return reply.status(400).send({ error: (error as Error).message }); }
     from = await clampAnalyticsFrom(workspaceId, from);
+    if (from > to) return reply.status(400).send({ error: 'Período fora da retenção disponível' });
 
     const span = Math.max(1, daysBetween(from, to));
     const prevFrom = addDays(from, -span);

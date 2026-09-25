@@ -12,6 +12,7 @@ export interface IUserStatus {
 
 export interface IUser extends Document {
   workspaceId: Types.ObjectId;
+  accountId?: Types.ObjectId;
   name: string;
   email: string;
   passwordHash: string;
@@ -44,6 +45,7 @@ const UserStatusSchema = new Schema<IUserStatus>(
 
 const UserSchema = new Schema<IUser>(
   {
+    accountId: { type: Schema.Types.ObjectId, ref: 'Account', index: true },
     workspaceId:  { type: Schema.Types.ObjectId, ref: 'Workspace', required: true },
     name:         { type: String, required: true, trim: true },
     email:        { type: String, required: true, lowercase: true, trim: true },
@@ -65,6 +67,7 @@ const UserSchema = new Schema<IUser>(
 );
 
 UserSchema.index({ email: 1, workspaceId: 1 }, { unique: true });
+UserSchema.index({ accountId: 1, workspaceId: 1 }, { unique: true, partialFilterExpression: { accountId: { $exists: true } } });
 // Covers routing.service.ts's pickAgent query — User.find({workspaceId, role,
 // availability, isActive}) — which the routing scheduler runs per queued
 // conversation, every tick, for every workspace with pending conversations.

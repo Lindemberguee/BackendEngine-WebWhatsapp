@@ -1,6 +1,8 @@
+import { requireHumanSession } from '../auth/authenticate';
+import { createInvitation, acceptInvitation } from './invitations.service';
 import type { FastifyInstance } from 'fastify';
 import { User } from '../../db/models';
-import { listTeam, createAgent, updateAgent, removeAgent, resetAgentPassword, getTeamStats, updateAvailability } from './team.service';
+import { listTeam, updateAgent, removeAgent, resetAgentPassword, getTeamStats, updateAvailability } from './team.service';
 import { notify } from '../notifications/notification.service';
 import type { WebSocketGateway } from '../../ws/gateway';
 import { requireRole } from '../../utils/require-role';
@@ -15,6 +17,13 @@ export async function teamRoutes(fastify: FastifyInstance, opts: { wsGateway: We
   const adminOnly = { preHandler: [fastify.authenticate, requireRole(['owner', 'admin'])] };
 
   // GET /api/team — any authenticated member
+  fastify.post('/invitations/accept', { preHandler: [fastify.authenticate, requireHumanSession] }, async (request, reply) => {
+    try {
+      const user = await acceptInvitation(request.user.sub, (request.body as { token?: unknown })?.token);
+      return reply.send({ data: { workspaceId: String(user.workspaceId), userId: String(user._id) } });
+    } catch (error) { return reply.status(400).send({ error: (error as Error).message }); }
+  });
+
   fastify.get('/', auth, async (request, reply) => {
     const { workspaceId } = request.user as { workspaceId: string };
     return reply.send({ data: await listTeam(workspaceId) });
@@ -39,17 +48,11 @@ export async function teamRoutes(fastify: FastifyInstance, opts: { wsGateway: We
   });
 
   // POST /api/team — invite / create member (owner/admin)
-  fastify.post('/', adminOnly, async (request, reply) => {
+  fastify.post('/', { preHandler: [fastify.authenticate, requireHumanSession, requireRole(['owner', 'admin'])] }, async (request, reply) => {
     const { workspaceId, sub } = request.user as { workspaceId: string; sub: string };
     try {
-      const actor = await actorInfo(sub);
-      const member = await createAgent(workspaceId, request.body as Record<string, string>, actor);
-      void notify(opts.wsGateway, {
-        workspaceId, recipientId: member.id, type: 'team.invited',
-        title: 'Bem-vindo(a) ao time!', message: `Você foi adicionado(a) ao workspace por ${actor?.name ?? 'um administrador'}`,
-        link: '/settings',
-      });
-      return reply.status(201).send({ data: member });
+      const invitation = await createInvitation(workspaceId, sub, request.body);
+      return reply.status(201).send({ data: invitation });
     } catch (err) {
       return reply.status(400).send({ error: (err as Error).message });
     }
@@ -63,6 +66,7 @@ export async function teamRoutes(fastify: FastifyInstance, opts: { wsGateway: We
     try {
       const actor = await actorInfo(sub);
       const member = await updateAgent(workspaceId, id, sub, body, actor);
+      opts.wsGateway.disconnectUser(id);
       if ('role' in body && id !== sub) {
         void notify(opts.wsGateway, {
           workspaceId, recipientId: id, type: 'team.role_changed',
@@ -83,6 +87,7 @@ export async function teamRoutes(fastify: FastifyInstance, opts: { wsGateway: We
     try {
       const actor = await actorInfo(sub);
       await removeAgent(workspaceId, id, sub, role, actor);
+      opts.wsGateway.disconnectUser(id);
       return reply.status(204).send();
     } catch (err) {
       return reply.status(400).send({ error: (err as Error).message });

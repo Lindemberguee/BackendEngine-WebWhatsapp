@@ -181,6 +181,7 @@ export class FlowRunner {
      *  episode. */
     _scheduledEventSourceAt?: Date;
   }): Promise<void> {
+    if (String(flow.workspaceId) !== params.workspaceId) throw new Error('Fluxo não pertence ao workspace da execução');
     const jumpDepth = params._jumpDepth ?? 0;
     if (jumpDepth > MAX_JUMP_DEPTH) {
       logger.error(

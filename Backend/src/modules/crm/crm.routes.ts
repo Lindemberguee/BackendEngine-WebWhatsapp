@@ -1,7 +1,9 @@
+import { pagination, pageMeta } from '../../shared/pagination';
+import { scopeConversationFilter } from '../../utils/conversation-visibility';
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import type { FastifyInstance } from 'fastify';
 import { Types } from 'mongoose';
-import { Pipeline, Lead, Contact, LeadActivity } from '../../db/models';
+import { Pipeline, Lead, Contact, LeadActivity, User, Conversation } from '../../db/models';
 import { DEFAULT_STAGES, ensureDefaultPipeline, toLeadResponse, nextOrder, logLeadActivity, getActorName, getCrmReport, getCrossPipelineReport } from './crm.service';
 import { triggerCrmFlow } from './crm-triggers';
 import { notify } from '../notifications/notification.service';
@@ -44,7 +46,6 @@ export async function crmRoutes(fastify: FastifyInstance, opts: { sessionManager
 
   fastify.get('/pipelines', auth, async (request, reply) => {
     const { workspaceId } = request.user as { workspaceId: string };
-    await ensureDefaultPipeline(workspaceId);
     const pipelines = await Pipeline.find({ workspaceId, archived: { $ne: true } }).sort({ isDefault: -1, createdAt: 1 });
     return reply.send({ data: pipelines.map((p) => p.toJSON()) });
   });
@@ -145,10 +146,12 @@ export async function crmRoutes(fastify: FastifyInstance, opts: { sessionManager
     }
     if (tag) filter.tags = tag;
     if (search) filter.title = { $regex: escapeRegex(search), $options: 'i' };
-    const leads = await Lead.find(filter).sort({ stageId: 1, order: 1 })
-      .populate('contactId', 'name phone avatarUrl email')
-      .populate('assigneeId', 'name');
-    return reply.send({ data: leads.map(toLeadResponse) });
+    const { page, limit, skip } = pagination(request.query);
+    const total = await Lead.countDocuments(filter);
+    const leads = await Lead.find(filter).sort({ stageId: 1, order: 1, _id: 1 }).skip(skip).limit(limit)
+      .populate({ path: 'contactId', select: 'name phone avatarUrl email', match: { workspaceId } })
+      .populate({ path: 'assigneeId', select: 'name', match: { workspaceId } });
+    return reply.send({ data: leads.map(toLeadResponse), meta: pageMeta(page, limit, total) });
   });
 
   fastify.get('/leads/:id', auth, async (request, reply) => {
@@ -156,8 +159,8 @@ export async function crmRoutes(fastify: FastifyInstance, opts: { sessionManager
     const { id } = request.params as { id: string };
     if (!valid(id)) return reply.status(404).send({ error: 'Lead não encontrado' });
     const lead = await Lead.findOne({ _id: id, workspaceId })
-      .populate('contactId', 'name phone avatarUrl email')
-      .populate('assigneeId', 'name');
+      .populate({ path: 'contactId', select: 'name phone avatarUrl email', match: { workspaceId } })
+      .populate({ path: 'assigneeId', select: 'name', match: { workspaceId } });
     if (!lead) return reply.status(404).send({ error: 'Lead não encontrado' });
     return reply.send(toLeadResponse(lead));
   });
@@ -174,6 +177,8 @@ export async function crmRoutes(fastify: FastifyInstance, opts: { sessionManager
     if (!pipeline) return reply.status(400).send({ error: 'Funil inválido' });
     const stageId = body.stageId && pipeline.stages.some((s) => s.id === body.stageId) ? body.stageId : pipeline.stages[0]?.id;
 
+    if (body.assigneeId != null && (typeof body.assigneeId !== 'string' || !valid(body.assigneeId) || !(await User.exists({ _id: body.assigneeId, workspaceId, isActive: true })))) return reply.status(400).send({ error: 'Responsável inválido para este workspace' });
+    if (body.conversationId != null && (typeof body.conversationId !== 'string' || !valid(body.conversationId) || !(await Conversation.exists(scopeConversationFilter({ _id: body.conversationId, workspaceId }, request.user))))) return reply.status(400).send({ error: 'Conversa inválida ou sem acesso' });
     const wid = new Types.ObjectId(workspaceId);
     const lead = await Lead.create({
       workspaceId: wid, pipelineId: pipeline._id, stageId, contactId: contact._id,
@@ -189,7 +194,7 @@ export async function crmRoutes(fastify: FastifyInstance, opts: { sessionManager
     });
     const { sub: actorId } = request.user as { sub?: string };
     await logLeadActivity({ workspaceId: wid, leadId: lead._id, type: 'created', message: 'Lead criado', actorId, actorName: await getActorName(actorId) });
-    await lead.populate('contactId', 'name phone avatarUrl email');
+    await lead.populate({ path: 'contactId', select: 'name phone avatarUrl email', match: { workspaceId } });
     return reply.status(201).send(toLeadResponse(lead));
   });
 
@@ -209,12 +214,13 @@ export async function crmRoutes(fastify: FastifyInstance, opts: { sessionManager
     const existing = await Lead.findOne({ _id: leadId, workspaceId });
     if (!existing) return reply.status(404).send({ error: 'Lead não encontrado' });
 
+    if (body.assigneeId != null && (typeof body.assigneeId !== 'string' || !valid(body.assigneeId) || !(await User.exists({ _id: body.assigneeId, workspaceId, isActive: true })))) return reply.status(400).send({ error: 'Responsável inválido para este workspace' });
     const update: Record<string, unknown> = { lastActivityAt: new Date() };
     for (const k of ['title', 'value', 'notes', 'tags', 'expectedCloseDate', 'customFields']) if (k in body) update[k] = body[k];
     if ('assigneeId' in body) update.assigneeId = body.assigneeId && valid(String(body.assigneeId)) ? body.assigneeId : null;
 
     const lead = await Lead.findOneAndUpdate({ _id: leadId, workspaceId }, update, { new: true })
-      .populate('contactId', 'name phone avatarUrl email').populate('assigneeId', 'name');
+      .populate({ path: 'contactId', select: 'name phone avatarUrl email', match: { workspaceId } }).populate({ path: 'assigneeId', select: 'name', match: { workspaceId } });
     if (!lead) return reply.status(404).send({ error: 'Lead não encontrado' });
 
     const changedValue = 'value' in body && Number(body.value) !== existing.value;
@@ -263,7 +269,7 @@ export async function crmRoutes(fastify: FastifyInstance, opts: { sessionManager
     const { workspaceId, sub: actorId } = request.user as { workspaceId: string; sub?: string };
     const { id } = request.params as { id: string };
     if (!valid(id)) return reply.status(404).send({ error: 'Lead não encontrado' });
-    const { stageId, order } = request.body as { stageId: string; order?: number };
+    const { stageId, order, beforeLeadId } = request.body as { stageId: string; order?: number; beforeLeadId?: string };
     const lead = await Lead.findOne({ _id: id, workspaceId });
     if (!lead) return reply.status(404).send({ error: 'Lead não encontrado' });
     const pipeline = await Pipeline.findById(lead.pipelineId);
@@ -271,6 +277,7 @@ export async function crmRoutes(fastify: FastifyInstance, opts: { sessionManager
     if (!stage) return reply.status(400).send({ error: 'Estágio inválido' });
     const fromStageName = pipeline?.stages.find((s) => s.id === lead.stageId)?.name ?? lead.stageId;
 
+    if (beforeLeadId !== undefined && (!valid(beforeLeadId) || beforeLeadId === id || !(await Lead.exists({ _id: beforeLeadId, workspaceId, pipelineId: lead.pipelineId, stageId })))) return reply.status(400).send({ error: 'Posição de destino inválida' });
     lead.stageId = stageId;
     lead.lastActivityAt = new Date();
     if (stage.kind === 'won') { lead.status = 'won'; lead.wonAt = new Date(); lead.lostAt = undefined; }
@@ -280,7 +287,8 @@ export async function crmRoutes(fastify: FastifyInstance, opts: { sessionManager
 
     // Re-sequence the target stage with the moved lead inserted at `order`.
     const siblings = await Lead.find({ workspaceId, pipelineId: lead.pipelineId, stageId, _id: { $ne: lead._id } }).sort({ order: 1 });
-    const idx = Math.max(0, Math.min(Number.isFinite(Number(order)) ? Number(order) : siblings.length, siblings.length));
+    const beforeIndex = beforeLeadId ? siblings.findIndex(sibling => String(sibling._id) === beforeLeadId) : -1;
+    const idx = beforeLeadId ? (beforeIndex >= 0 ? beforeIndex : siblings.length) : Math.max(0, Math.min(Number.isFinite(Number(order)) ? Number(order) : siblings.length, siblings.length));
     siblings.splice(idx, 0, lead);
     await Promise.all(siblings.map((l, i) => Lead.updateOne({ _id: l._id }, { order: i })));
 
@@ -310,8 +318,8 @@ export async function crmRoutes(fastify: FastifyInstance, opts: { sessionManager
       }
     }
 
-    await lead.populate('contactId', 'name phone avatarUrl email');
-    await lead.populate('assigneeId', 'name');
+    await lead.populate({ path: 'contactId', select: 'name phone avatarUrl email', match: { workspaceId } });
+    await lead.populate({ path: 'assigneeId', select: 'name', match: { workspaceId } });
     return reply.send(toLeadResponse(lead));
   });
 
@@ -336,7 +344,7 @@ export async function crmRoutes(fastify: FastifyInstance, opts: { sessionManager
         link: '/crm', metadata: { leadId: lead._id.toString() },
       });
     }
-    await lead.populate('contactId', 'name phone avatarUrl email');
+    await lead.populate({ path: 'contactId', select: 'name phone avatarUrl email', match: { workspaceId } });
     return reply.send(toLeadResponse(lead));
   });
 
@@ -366,7 +374,7 @@ export async function crmRoutes(fastify: FastifyInstance, opts: { sessionManager
         link: '/crm', metadata: { leadId: lead._id.toString() },
       });
     }
-    await lead.populate('contactId', 'name phone avatarUrl email');
+    await lead.populate({ path: 'contactId', select: 'name phone avatarUrl email', match: { workspaceId } });
     return reply.send(toLeadResponse(lead));
   });
 

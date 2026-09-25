@@ -2,6 +2,7 @@ import { Schema, model, Document, Types } from 'mongoose';
 
 export interface IAuthSession extends Document {
   userId: Types.ObjectId;
+  tokenVersion: number;
   workspaceId: Types.ObjectId;
   refreshTokenHash: string;
   expiresAt: Date;
@@ -12,6 +13,7 @@ export interface IAuthSession extends Document {
 
 const AuthSessionSchema = new Schema<IAuthSession>(
   {
+    tokenVersion: { type: Number, default: 0 },
     userId: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
     workspaceId: { type: Schema.Types.ObjectId, ref: 'Workspace', required: true },
     refreshTokenHash: { type: String, required: true, unique: true },

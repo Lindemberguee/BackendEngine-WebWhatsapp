@@ -81,23 +81,30 @@ export async function nextOrder(workspaceId: Types.ObjectId, pipelineId: Types.O
  * Scoped to open leads for the forecast/stage numbers; won/lost leads feed the
  * agent leaderboard and lost-reason breakdown.
  */
+async function reportLeadGroups(workspaceId: string, pipelineIds: string[], range?: { from?: Date; to?: Date }) {
+  const dateFilter = { ...(range?.from ? { $gte: range.from } : {}), ...(range?.to ? { $lte: range.to } : {}) };
+  const dated = Object.keys(dateFilter).length > 0;
+  const rows = await Lead.aggregate<{ pipelineId: Types.ObjectId; stageId: string; status: string; assigneeId?: Types.ObjectId; lostReason?: string; value: number; _count: number }>([
+    { $match: { workspaceId: new Types.ObjectId(workspaceId), pipelineId: { $in: pipelineIds.map(id => new Types.ObjectId(id)) },
+      $or: [{ status: 'open' }, { status: 'won', ...(dated ? { wonAt: dateFilter } : {}) }, { status: 'lost', ...(dated ? { lostAt: dateFilter } : {}) }] } },
+    { $group: { _id: { pipelineId: '$pipelineId', stageId: '$stageId', status: '$status', assigneeId: '$assigneeId', lostReason: { $cond: [{ $eq: ['$status', 'lost'] }, { $trim: { input: { $ifNull: ['$lostReason', ''] } } }, ''] } }, value: { $sum: '$value' }, _count: { $sum: 1 } } },
+    { $project: { _id: 0, pipelineId: '$_id.pipelineId', stageId: '$_id.stageId', status: '$_id.status', assigneeId: '$_id.assigneeId', lostReason: '$_id.lostReason', value: 1, _count: 1 } },
+  ]).allowDiskUse(true);
+  await Lead.populate(rows, { path: 'assigneeId', select: 'name', match: { workspaceId } });
+  return rows;
+}
+const groupCount = (rows: Array<{ _count: number }>) => rows.reduce((count, row) => count + row._count, 0);
+
 export async function getCrmReport(workspaceId: string, pipelineId: string, range?: { from?: Date; to?: Date }) {
   const pipeline = await Pipeline.findOne({ _id: pipelineId, workspaceId });
   if (!pipeline) return null;
 
-  const leads = await Lead.find({ workspaceId, pipelineId }).populate('assigneeId', 'name').lean();
+  const leads = await reportLeadGroups(workspaceId, [pipelineId], range);
   // Date range only scopes closed leads (won/lost by their close date) — open
   // leads always reflect the current, live pipeline regardless of period.
-  const inRange = (d?: Date) => {
-    if (!range?.from && !range?.to) return true;
-    if (!d) return false;
-    if (range.from && d < range.from) return false;
-    if (range.to && d > range.to) return false;
-    return true;
-  };
   const open = leads.filter((l) => l.status === 'open');
-  const won = leads.filter((l) => l.status === 'won' && inRange(l.wonAt));
-  const lost = leads.filter((l) => l.status === 'lost' && inRange(l.lostAt));
+  const won = leads.filter((l) => l.status === 'won');
+  const lost = leads.filter((l) => l.status === 'lost');
 
   const byStage = pipeline.stages
     .filter((s) => s.kind === 'open')
@@ -107,15 +114,15 @@ export async function getCrmReport(workspaceId: string, pipelineId: string, rang
       const probability = s.probability ?? defaultProbabilityForKind(s.kind);
       return {
         stageId: s.id, stageName: s.name, color: s.color, probability,
-        count: stageLeads.length, value, weightedValue: Math.round(value * (probability / 100)),
+        count: groupCount(stageLeads), value, weightedValue: Math.round(value * (probability / 100)),
       };
     });
 
   const forecast = byStage.reduce((sum, s) => sum + s.weightedValue, 0);
   const pipelineValue = open.reduce((sum, l) => sum + (l.value ?? 0), 0);
   const wonValue = won.reduce((sum, l) => sum + (l.value ?? 0), 0);
-  const closedCount = won.length + lost.length;
-  const conversionRate = closedCount > 0 ? Math.round((won.length / closedCount) * 100) : 0;
+  const closedCount = groupCount(won) + groupCount(lost);
+  const conversionRate = closedCount > 0 ? Math.round((groupCount(won) / closedCount) * 100) : 0;
 
   const agentMap = new Map<string, { agentId: string; agentName: string; won: number; lost: number; wonValue: number }>();
   for (const l of [...won, ...lost]) {
@@ -123,8 +130,8 @@ export async function getCrmReport(workspaceId: string, pipelineId: string, rang
     const id = assignee?._id?.toString() ?? 'unassigned';
     const name = assignee?.name ?? 'Sem responsável';
     const entry = agentMap.get(id) ?? { agentId: id, agentName: name, won: 0, lost: 0, wonValue: 0 };
-    if (l.status === 'won') { entry.won += 1; entry.wonValue += l.value ?? 0; }
-    else entry.lost += 1;
+    if (l.status === 'won') { entry.won += l._count; entry.wonValue += l.value ?? 0; }
+    else entry.lost += l._count;
     agentMap.set(id, entry);
   }
   const byAgent = [...agentMap.values()]
@@ -134,7 +141,7 @@ export async function getCrmReport(workspaceId: string, pipelineId: string, rang
   const reasonMap = new Map<string, number>();
   for (const l of lost) {
     const reason = l.lostReason?.trim() || 'Sem motivo informado';
-    reasonMap.set(reason, (reasonMap.get(reason) ?? 0) + 1);
+    reasonMap.set(reason, (reasonMap.get(reason) ?? 0) + l._count);
   }
   const lostReasons = [...reasonMap.entries()]
     .map(([reason, count]) => ({ reason, count }))
@@ -168,13 +175,13 @@ export async function getStageTimings(
   const pipeline = preloadedPipeline ?? (await Pipeline.findOne({ _id: pipelineId, workspaceId }).lean());
   if (!pipeline) return [];
 
-  const leadIds = await Lead.find({ workspaceId, pipelineId }).select('_id').lean();
-  if (leadIds.length === 0) return [];
-
-  const activities = await LeadActivity.find({
-    workspaceId, leadId: { $in: leadIds.map((l) => l._id) },
-    type: { $in: ['created', 'stage_changed'] },
-  }).sort({ leadId: 1, createdAt: 1 }).lean();
+  const activities = LeadActivity.aggregate([
+    { $match: { workspaceId: new Types.ObjectId(workspaceId), type: { $in: ['created', 'stage_changed'] } } },
+    { $lookup: { from: Lead.collection.name, localField: 'leadId', foreignField: '_id', pipeline: [{ $match: { workspaceId: new Types.ObjectId(workspaceId), pipelineId: new Types.ObjectId(pipelineId) } }, { $project: { _id: 1 } }], as: 'matchingLead' } },
+    { $match: { 'matchingLead.0': { $exists: true } } },
+    { $project: { matchingLead: 0 } },
+    { $sort: { leadId: 1, createdAt: 1, _id: 1 } },
+  ]).allowDiskUse(true).cursor({ batchSize: 250 });
 
   const durations = new Map<string, { totalMs: number; count: number }>();
   let currentLeadId = '';
@@ -182,7 +189,7 @@ export async function getStageTimings(
   let enteredAt: Date | null = null;
   const firstStageId = [...pipeline.stages].sort((a, b) => a.order - b.order)[0]?.id ?? null;
 
-  for (const a of activities) {
+  for await (const a of activities) {
     const leadId = a.leadId.toString();
     if (leadId !== currentLeadId) {
       currentLeadId = leadId;
@@ -232,17 +239,8 @@ export async function getCrossPipelineReport(workspaceId: string, range?: { from
   const pipelines = await Pipeline.find({ workspaceId, archived: { $ne: true } });
   if (pipelines.length === 0) return null;
 
-  const inRange = (d?: Date) => {
-    if (!range?.from && !range?.to) return true;
-    if (!d) return false;
-    if (range.from && d < range.from) return false;
-    if (range.to && d > range.to) return false;
-    return true;
-  };
 
-  const allLeads = await Lead.find({ workspaceId, pipelineId: { $in: pipelines.map((p) => p._id) } })
-    .populate('assigneeId', 'name')
-    .lean();
+  const allLeads = await reportLeadGroups(workspaceId, pipelines.map(p => String(p._id)), range);
 
   let pipelineValue = 0;
   let wonValue = 0;
@@ -257,18 +255,18 @@ export async function getCrossPipelineReport(workspaceId: string, range?: { from
     const pid = pipeline._id.toString();
     const leads = allLeads.filter((l) => l.pipelineId.toString() === pid);
     const open = leads.filter((l) => l.status === 'open');
-    const won = leads.filter((l) => l.status === 'won' && inRange(l.wonAt));
-    const lost = leads.filter((l) => l.status === 'lost' && inRange(l.lostAt));
+    const won = leads.filter((l) => l.status === 'won');
+    const lost = leads.filter((l) => l.status === 'lost');
 
     const openValue = open.reduce((sum, l) => sum + (l.value ?? 0), 0);
     const pipelineWonValue = won.reduce((sum, l) => sum + (l.value ?? 0), 0);
-    const closedCount = won.length + lost.length;
-    const conversionRate = closedCount > 0 ? Math.round((won.length / closedCount) * 100) : 0;
+    const closedCount = groupCount(won) + groupCount(lost);
+    const conversionRate = closedCount > 0 ? Math.round((groupCount(won) / closedCount) * 100) : 0;
 
     pipelineValue += openValue;
     wonValue += pipelineWonValue;
-    totalWon += won.length;
-    totalLost += lost.length;
+    totalWon += groupCount(won);
+    totalLost += groupCount(lost);
 
     for (const s of pipeline.stages.filter((st) => st.kind === 'open')) {
       const stageLeads = open.filter((l) => l.stageId === s.id);
@@ -282,13 +280,13 @@ export async function getCrossPipelineReport(workspaceId: string, range?: { from
       const id = assignee?._id?.toString() ?? 'unassigned';
       const name = assignee?.name ?? 'Sem responsável';
       const entry = agentMap.get(id) ?? { agentId: id, agentName: name, won: 0, lost: 0, wonValue: 0 };
-      if (l.status === 'won') { entry.won += 1; entry.wonValue += l.value ?? 0; }
-      else entry.lost += 1;
+      if (l.status === 'won') { entry.won += l._count; entry.wonValue += l.value ?? 0; }
+      else entry.lost += l._count;
       agentMap.set(id, entry);
     }
     for (const l of lost) {
       const reason = l.lostReason?.trim() || 'Sem motivo informado';
-      reasonMap.set(reason, (reasonMap.get(reason) ?? 0) + 1);
+      reasonMap.set(reason, (reasonMap.get(reason) ?? 0) + l._count);
     }
 
     byPipeline.push({ pipelineId: pid, name: pipeline.name, openValue, wonValue: pipelineWonValue, conversionRate });

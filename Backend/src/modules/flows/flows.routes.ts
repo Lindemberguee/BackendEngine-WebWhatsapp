@@ -1,3 +1,5 @@
+import { pagination, pageMeta } from '../../shared/pagination';
+import { ownsFlowInstance } from './flow-ownership';
 import type { FastifyInstance } from 'fastify';
 import { Types } from 'mongoose';
 import { randomBytes } from 'crypto';
@@ -82,6 +84,9 @@ const REDACTED = '••••••••';
  * replaced.
  */
 function redactWebhookHeaders<T extends Record<string, unknown>>(flowJson: T): T {
+  const trigger = flowJson.trigger && typeof flowJson.trigger === 'object' ? { ...flowJson.trigger as Record<string, unknown> } : undefined;
+  if (trigger) delete trigger.webhookToken;
+  flowJson = { ...flowJson, ...(trigger ? { trigger } : {}) };
   const nodes = Array.isArray(flowJson.nodes) ? (flowJson.nodes as Array<Record<string, any>>) : [];
   let changed = false;
   const redactedNodes = nodes.map((n) => {
@@ -122,9 +127,11 @@ export async function flowsRoutes(fastify: FastifyInstance, opts: { wsGateway: W
   fastify.get('/', auth, async (request, reply) => {
     const { workspaceId, role } = request.user as { workspaceId: string; role: string };
     const canSeeSecrets = role === 'owner' || role === 'admin';
-    const flows = await Flow.find({ workspaceId: new Types.ObjectId(workspaceId) }).sort({ updatedAt: -1 });
+    const { page, limit, skip } = pagination(request.query);
+    const filter = { workspaceId: new Types.ObjectId(workspaceId) };
+    const [flows, total] = await Promise.all([Flow.find(filter).sort({ updatedAt: -1, _id: -1 }).skip(skip).limit(limit), Flow.countDocuments(filter)]);
     const data = flows.map((f) => f.toJSON()).map((f) => (canSeeSecrets ? f : redactWebhookHeaders(f)));
-    return reply.send({ data });
+    return reply.send({ data, meta: pageMeta(page, limit, total) });
   });
 
   // GET /api/flows/:id
@@ -144,7 +151,7 @@ export async function flowsRoutes(fastify: FastifyInstance, opts: { wsGateway: W
   // that (paired with the frontend polling this on an interval while the panel
   // is open; a full push-based WS stream is a larger follow-up, not needed to
   // close the "no visibility at all" gap).
-  fastify.get('/:id/runs', auth, async (request, reply) => {
+  fastify.get('/:id/runs', canWrite, async (request, reply) => {
     const { workspaceId } = request.user as { workspaceId: string };
     const { id } = request.params as { id: string };
     if (!valid(id)) return reply.status(404).send({ error: 'Fluxo não encontrado' });
@@ -261,6 +268,7 @@ export async function flowsRoutes(fastify: FastifyInstance, opts: { wsGateway: W
       update.trigger = extractTrigger(body.nodes, existing.trigger?.webhookToken);
       update.instanceId = extractInstance(body.nodes);
     }
+    if ((body.nodes !== undefined || body.enabled === true) && !(await ownsFlowInstance(workspaceId, extractInstance(body.nodes ?? existing.nodes)))) return reply.status(400).send({ error: 'Instância não pertence ao workspace' });
     if (body.edges !== undefined) update.edges = body.edges;
 
     if (body.enabled === true && !existing.enabled) {
@@ -325,6 +333,7 @@ export async function flowsRoutes(fastify: FastifyInstance, opts: { wsGateway: W
     // other place a flow goes live, and previously skipped this entirely: a flow
     // with no entry node, a dangling edge, or an auto-advancing cycle could be
     // published and start running (or flooding) in production.
+    if (!(await ownsFlowInstance(workspaceId, extractInstance(existing.nodes)))) return reply.status(400).send({ error: 'Instância não pertence ao workspace' });
     const validationError = validateForActivation({ nodes: existing.nodes as IFlow['nodes'], edges: existing.edges as IFlow['edges'] });
     if (validationError) return reply.status(400).send({ error: validationError });
 

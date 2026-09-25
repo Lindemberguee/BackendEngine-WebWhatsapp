@@ -1,3 +1,4 @@
+import { ownsFlowInstance } from '../flows/flow-ownership';
 import pino from 'pino';
 import { Flow, FlowRun, Contact, Conversation, WebhookInboundLog } from '../../db/models';
 import type { SessionManager } from '../../session-manager/SessionManager';
@@ -38,6 +39,7 @@ export async function triggerWebhookFlow(
 
     const instanceId = flow.instanceId.toString();
 
+    if (!(await ownsFlowInstance(workspaceId, instanceId))) throw new WebhookTriggerError('Instância indisponível', 422);
     const session = await sessionManager.ensureSession(instanceId);
     const ready = await session.waitUntilReady(8000);
     if (!ready) throw new WebhookTriggerError('WhatsApp reconectando. Tente novamente em alguns segundos.', 503);

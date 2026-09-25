@@ -42,13 +42,12 @@ export function isPublicHttpUrl(rawUrl: string): boolean {
   // above, since ::ffff:169.254.169.254 is the cloud-metadata address in disguise).
   if (host.startsWith('[') && host.endsWith(']')) {
     const v6 = host.slice(1, -1);
-    if (v6 === '::1' || v6 === '::') return false;
-    if (/^fe80:/i.test(v6) || /^f[cd][0-9a-f]{2}:/i.test(v6)) return false;
-    const mapped = v6.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i);
-    if (mapped) {
-      const [a, b] = mapped[1].split('.').map(Number);
-      if (isBlockedIpv4(a, b)) return false;
-    }
+    // Only global unicast (2000::/3); exclude transition/documentation ranges.
+    // Mapped IPv4 is normalized by URL into hexadecimal and must never bypass this gate.
+    const first = parseInt(v6.split(':')[0] || '0', 16);
+    if (first < 0x2000 || first > 0x3fff) return false;
+    const second = parseInt(v6.split(':')[1] || '0', 16);
+    if (first === 0x2002 || first === 0x3fff || (first === 0x2001 && (second < 0x200 || second === 0xdb8))) return false;
     return true;
   }
   if (host === '::1') return false;

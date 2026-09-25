@@ -1,3 +1,4 @@
+import { requireRole } from '../../utils/require-role';
 import type { FastifyInstance } from 'fastify';
 import { Types } from 'mongoose';
 import { CloseReason } from '../../db/models';
@@ -7,6 +8,7 @@ const HEX_RE = /^#[0-9a-fA-F]{6}$/;
 
 export async function closeReasonsRoutes(fastify: FastifyInstance): Promise<void> {
   const auth = { preHandler: [fastify.authenticate] };
+  const canWrite = { preHandler: [fastify.authenticate, requireRole(['owner', 'admin', 'agent'])] };
 
   // GET /api/close-reasons — list workspace closing reasons
   fastify.get('/', auth, async (request, reply) => {
@@ -18,7 +20,7 @@ export async function closeReasonsRoutes(fastify: FastifyInstance): Promise<void
   });
 
   // POST /api/close-reasons — create { label, color? }
-  fastify.post('/', auth, async (request, reply) => {
+  fastify.post('/', canWrite, async (request, reply) => {
     const { workspaceId } = request.user as { workspaceId: string };
     const { label, color } = request.body as { label?: string; color?: string };
 
@@ -39,7 +41,7 @@ export async function closeReasonsRoutes(fastify: FastifyInstance): Promise<void
   });
 
   // PATCH /api/close-reasons/:id — rename / recolor
-  fastify.patch('/:id', auth, async (request, reply) => {
+  fastify.patch('/:id', canWrite, async (request, reply) => {
     const { workspaceId } = request.user as { workspaceId: string };
     const { id } = request.params as { id: string };
     const { label, color } = request.body as { label?: string; color?: string };
@@ -66,7 +68,7 @@ export async function closeReasonsRoutes(fastify: FastifyInstance): Promise<void
   });
 
   // DELETE /api/close-reasons/:id — old conversation references become stale (shown as "Motivo removido")
-  fastify.delete('/:id', auth, async (request, reply) => {
+  fastify.delete('/:id', canWrite, async (request, reply) => {
     const { workspaceId } = request.user as { workspaceId: string };
     const { id } = request.params as { id: string };
 

@@ -1,3 +1,4 @@
+import { protectCookieMutation, redactRequestUrl } from './shared/request-origin';
 import 'dotenv/config';
 import * as Sentry from '@sentry/node';
 import Fastify from 'fastify';
@@ -9,9 +10,8 @@ import multipart from '@fastify/multipart';
 import rateLimit from '@fastify/rate-limit';
 import cookie from '@fastify/cookie';
 import mongoose from 'mongoose';
-import { createHash } from 'crypto';
 import { connectDatabase, disconnectDatabase } from './db/connection';
-import { User, ApiKey, Workspace } from './db/models';
+import { registerAuthentication } from './modules/auth/authenticate';
 import { deduplicateConversations } from './db/migrations/dedup-conversations';
 import { WebSocketGateway } from './ws/gateway';
 import { SessionManager } from './session-manager/SessionManager';
@@ -57,7 +57,7 @@ import { validateMediaStorageConfig } from './shared/media-storage';
 import { runStartupDiagnostics } from './shared/startup-diagnostics';
 import { ACCESS_COOKIE } from './modules/auth/session.service';
 
-const ROLE_RANK = { viewer: 1, agent: 2, admin: 3, owner: 4 } as const;
+
 
 // ── Error tracking ─────────────────────────────────────────────────────────────
 // No-op without a DSN — local/dev never sends anything anywhere. Set SENTRY_DSN
@@ -94,7 +94,7 @@ const fastify = Fastify({
     // log (and whatever aggregator/Sentry breadcrumb reads it) on every connect.
     serializers: {
       req(request) {
-        return { method: request.method, url: request.url.split('?')[0], hostname: request.hostname, remoteAddress: request.ip };
+        return { method: request.method, url: redactRequestUrl(request.url), hostname: request.hostname, remoteAddress: request.ip };
       },
     },
   },
@@ -171,6 +171,7 @@ async function bootstrap(): Promise<void> {
   });
 
   await fastify.register(cookie);
+  fastify.addHook('onRequest', protectCookieMutation);
 
   // Falling back to a literal secret in production would let anyone forge a
   // valid token for any user/workspace — fail loudly at boot instead of
@@ -221,49 +222,7 @@ async function bootstrap(): Promise<void> {
   // same Authorization: Bearer header — this makes every existing authenticated
   // route usable by an API key automatically, scoped by the key's role, with zero
   // changes to any individual route file. See modules/api-keys/api-keys.routes.ts.
-  fastify.decorate('authenticate', async (request: Parameters<typeof fastify.authenticate>[0], reply: Parameters<typeof fastify.authenticate>[1]) => {
-    const authHeader = request.headers.authorization ?? '';
-    const bearer = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
-
-    if (bearer.startsWith('wsk_')) {
-      const keyHash = createHash('sha256').update(bearer).digest('hex');
-      const key = await ApiKey.findOne({ keyHash, revokedAt: { $exists: false } });
-      if (!key) return reply.status(401).send({ error: 'Chave de API inválida ou revogada' });
-      const keyWorkspace = await Workspace.findById(key.workspaceId).select('status').lean();
-      if (!keyWorkspace || keyWorkspace.status === 'suspended') return reply.status(403).send({ error: 'Workspace suspenso' });
-      const creator = await User.findOne({ _id: key.createdBy, workspaceId: key.workspaceId, isActive: true }).select('role').lean();
-      if (!creator) return reply.status(401).send({ error: 'Invalid API key' });
-      const role = ROLE_RANK[key.role] <= ROLE_RANK[creator.role] ? key.role : creator.role;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (request as any).user = { sub: key.createdBy.toString(), workspaceId: key.workspaceId.toString(), role };
-      void ApiKey.updateOne({ _id: key._id }, { $set: { lastUsedAt: new Date() } }).catch(() => {});
-      return;
-    }
-
-    try {
-      await request.jwtVerify();
-    } catch {
-      return reply.status(401).send({ error: 'Token inválido ou expirado' });
-    }
-    // tokenVersion check — lets "change password" / "log out other sessions" invalidate
-    // every previously-issued JWT immediately, since JWTs are otherwise stateless.
-    // Tokens signed before this field existed have tokenVersion undefined and are treated as 0.
-    const { sub, tokenVersion, workspaceId } = request.user as { sub: string; tokenVersion?: number; workspaceId?: string };
-    const current = await User.findById(sub).select('tokenVersion isActive workspaceId').lean();
-    if (!current || (current.tokenVersion ?? 0) !== (tokenVersion ?? 0) || current.workspaceId.toString() !== workspaceId) {
-      return reply.status(401).send({ error: 'Sessão expirada — faça login novamente' });
-    }
-    // A deactivated agent's existing token stays structurally valid (same
-    // tokenVersion) until something else bumps it — deny explicitly here too,
-    // since this query already runs on every authenticated request either way.
-    if (current.isActive === false) {
-      return reply.status(401).send({ error: 'Conta desativada' });
-    }
-    const workspace = await Workspace.findById(current.workspaceId).select('status').lean();
-    if (!workspace || workspace.status === 'suspended') {
-      return reply.status(403).send({ error: 'Workspace suspenso — fale com o suporte' });
-    }
-  });
+  registerAuthentication(fastify);
 
   // ── Infrastructure ────────────────────────────────────────────────────────
   const wsGateway = new WebSocketGateway();
@@ -303,7 +262,7 @@ async function bootstrap(): Promise<void> {
   fastify.register(apiKeysRoutes,       { prefix: '/api/api-keys' });
   fastify.register(templatesRoutes,     { prefix: '/api/templates' });
   fastify.register(scheduledMessagesRoutes, { prefix: '/api', sessionManager, wsGateway });
-  fastify.register(platformRoutes,        { prefix: '/api/platform' });
+  fastify.register(platformRoutes,        { prefix: '/api/platform', wsGateway });
 
   // ── Health ────────────────────────────────────────────────────────────────
   // readyState 1 = connected. Anything else means the API is up but can't actually
@@ -417,17 +376,3 @@ bootstrap().catch((err) => {
   console.error('Fatal error:', err);
   process.exit(1);
 });
-
-// Augment Fastify types
-declare module 'fastify' {
-  interface FastifyInstance {
-    authenticate: (request: import('fastify').FastifyRequest, reply: import('fastify').FastifyReply) => Promise<void>;
-  }
-}
-
-declare module '@fastify/jwt' {
-  interface FastifyJWT {
-    payload: { sub: string; workspaceId: string; role: string; tokenVersion?: number };
-    user: { sub: string; workspaceId: string; role: string; tokenVersion?: number };
-  }
-}

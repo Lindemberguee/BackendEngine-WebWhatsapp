@@ -36,13 +36,13 @@ async function buildGroup(g: {
   _id: unknown; workspaceId: unknown; name: string; emoji?: string; color?: string; description?: string;
   leadId?: unknown; memberIds?: unknown[]; createdAt: Date; updatedAt: Date;
   routingStrategy?: RoutingStrategy; roundRobinCursor?: number; businessHours?: IBusinessHours; sla?: ITeamGroupSla;
-}, workspaceId: string) {
+}, workspaceId: string, userMap?: Map<string, { _id: unknown; name: string; email: string; avatarUrl?: string; role: string; isActive: boolean }>) {
   const memberIds = (g.memberIds ?? []) as Types.ObjectId[];
-  const members = await User.find({ _id: { $in: memberIds }, workspaceId: wsOid(workspaceId) })
+  const members = userMap ? memberIds.map(id => userMap.get(String(id))).filter((user): user is NonNullable<typeof user> => !!user) : await User.find({ _id: { $in: memberIds }, workspaceId: wsOid(workspaceId) })
     .select('name email avatarUrl role isActive')
     .lean();
   const lead = g.leadId
-    ? await User.findOne({ _id: g.leadId, workspaceId: wsOid(workspaceId) }).select('name email avatarUrl role').lean()
+    ? userMap ? userMap.get(String(g.leadId)) : await User.findOne({ _id: g.leadId, workspaceId: wsOid(workspaceId) }).select('name email avatarUrl role').lean()
     : null;
 
   return {
@@ -72,7 +72,10 @@ export async function teamGroupsRoutes(fastify: FastifyInstance): Promise<void> 
   fastify.get('/', auth, async (request, reply) => {
     const { workspaceId } = request.user as { workspaceId: string };
     const groups = await TeamGroup.find({ workspaceId: wsOid(workspaceId) }).sort({ name: 1 }).lean();
-    const data = await Promise.all(groups.map((g) => buildGroup(g, workspaceId)));
+    const ids = groups.flatMap(group => [...(group.memberIds ?? []), ...(group.leadId ? [group.leadId] : [])]);
+    const users = await User.find({ workspaceId: wsOid(workspaceId), _id: { $in: ids } }).select('name email avatarUrl role isActive').lean();
+    const userMap = new Map(users.map(user => [String(user._id), user]));
+    const data = await Promise.all(groups.map((g) => buildGroup(g, workspaceId, userMap)));
     return reply.send({ data });
   });
 

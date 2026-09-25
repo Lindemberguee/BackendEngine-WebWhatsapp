@@ -1,6 +1,8 @@
 export { Workspace } from './Workspace.model';
 export { User } from './User.model';
 export { AuthSession } from './AuthSession.model';
+export { PasswordResetToken } from './PasswordResetToken.model';
+export { PlatformLoginAttempt } from './PlatformLoginAttempt.model';
 export { Instance } from './Instance.model';
 export { Conversation } from './Conversation.model';
 export { Message } from './Message.model';

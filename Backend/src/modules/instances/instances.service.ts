@@ -10,7 +10,7 @@ const DEFAULT_GRAPH_VERSION = process.env.META_GRAPH_VERSION ?? 'v25.0';
 type Actor = { id: string; name: string; email: string };
 
 /** Attaches real, computed usage stats to an instance response — no fabricated numbers. */
-async function withStats(instanceDoc: { toJSON: () => Record<string, unknown> } | null, includePairing = false) {
+async function withStats(instanceDoc: { toJSON: () => Record<string, unknown> } | null, includePairing = false, totals?: { messagesSent: number; messagesReceived: number; messagesToday: number; conversationsTotal: number }) {
   if (!instanceDoc) return null;
   const instance = instanceDoc.toJSON();
   if (!includePairing) {
@@ -18,6 +18,7 @@ async function withStats(instanceDoc: { toJSON: () => Record<string, unknown> } 
     delete instance.qrExpiresAt;
     delete instance.pairingCode;
   }
+  if (totals) return { ...instance, stats: totals };
   const instanceId = instance.id as string;
   const todayStart = new Date();
   todayStart.setHours(0, 0, 0, 0);
@@ -39,7 +40,17 @@ export function createInstancesService(sessionManager: SessionManager) {
   return {
     async list(workspaceId: string, includePairing = false) {
       const docs = await Instance.find({ workspaceId }).select('-authCreds -authKeys').sort({ createdAt: -1 });
-      return Promise.all(docs.map((d) => withStats(d, includePairing)));
+      const ids = docs.map(doc => doc._id);
+      const today = new Date(); today.setHours(0, 0, 0, 0);
+      const [messages, conversations] = await Promise.all([
+        Message.aggregate<{ _id: Types.ObjectId; sent: number; received: number; today: number }>([
+          { $match: { workspaceId: new Types.ObjectId(workspaceId), instanceId: { $in: ids } } },
+          { $group: { _id: '$instanceId', sent: { $sum: { $cond: [{ $eq: ['$direction', 'outbound'] }, 1, 0] } }, received: { $sum: { $cond: [{ $eq: ['$direction', 'inbound'] }, 1, 0] } }, today: { $sum: { $cond: [{ $gte: ['$createdAt', today] }, 1, 0] } } } },
+        ]),
+        Conversation.aggregate<{ _id: Types.ObjectId; count: number }>([{ $match: { workspaceId: new Types.ObjectId(workspaceId), instanceId: { $in: ids } } }, { $group: { _id: '$instanceId', count: { $sum: 1 } } }]),
+      ]);
+      const msgMap = new Map(messages.map(row => [String(row._id), row])); const convMap = new Map(conversations.map(row => [String(row._id), row.count]));
+      return Promise.all(docs.map(doc => { const stats = msgMap.get(String(doc._id)); return withStats(doc, includePairing, { messagesSent: stats?.sent ?? 0, messagesReceived: stats?.received ?? 0, messagesToday: stats?.today ?? 0, conversationsTotal: convMap.get(String(doc._id)) ?? 0 }); }));
     },
 
     async get(workspaceId: string, instanceId: string, includePairing = false) {

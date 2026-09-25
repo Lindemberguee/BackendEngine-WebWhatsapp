@@ -1,7 +1,8 @@
+import { isAllowedOrigin } from '../shared/request-origin';
 import type { FastifyInstance } from 'fastify';
 import type { WebSocket } from '@fastify/websocket';
 import pino from 'pino';
-import { User } from '../db/models';
+import { User, Workspace } from '../db/models';
 import { ACCESS_COOKIE } from '../modules/auth/session.service';
 
 const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' });
@@ -23,6 +24,7 @@ export class WebSocketGateway {
       '/ws',
       { websocket: true },
       async (socket, request) => {
+        if (!isAllowedOrigin(request.headers.origin)) { socket.close(1008, 'Origin denied'); return; }
         // Prefer the short-lived HttpOnly access cookie — it needs nothing from
         // the client beyond just connecting. Fall back to a `?ticket=` query
         // param (a 30s single-purpose token, see issueWsTicket()) for the cases
@@ -37,11 +39,14 @@ export class WebSocketGateway {
         let userId: string | undefined;
         let role: string | undefined;
         let tokenVersion: number | undefined;
+        let expiresAt = 0;
         try {
           const query = request.query as { ticket?: string } | undefined;
           const token = request.cookies[ACCESS_COOKIE] || query?.ticket;
           if (token) {
-            const decoded = fastify.jwt.verify(token) as { workspaceId?: string; sub?: string; role?: string; tokenVersion?: number };
+            const decoded = fastify.jwt.verify(token) as { workspaceId?: string; sub?: string; role?: string; tokenVersion?: number; exp?: number; purpose?: string; sessionExpiresAt?: number };
+            if (request.cookies[ACCESS_COOKIE] ? decoded.purpose === 'ws' : decoded.purpose !== 'ws') throw new Error('Wrong token purpose');
+            expiresAt = (decoded.purpose === 'ws' ? decoded.sessionExpiresAt ?? decoded.exp ?? 0 : decoded.exp ?? 0) * 1000;
             workspaceId = decoded.workspaceId;
             userId = decoded.sub;
             role = decoded.role;
@@ -65,7 +70,7 @@ export class WebSocketGateway {
           logger.warn({ err }, '[WS] Token verification failed');
         }
 
-        if (!workspaceId) {
+        if (!workspaceId || !userId || !role || !['owner', 'admin', 'agent', 'viewer'].includes(role) || expiresAt <= Date.now()) {
           socket.close(1008, 'Unauthorized');
           return;
         }
@@ -77,13 +82,15 @@ export class WebSocketGateway {
         // socket (or a freshly-opened one with their old token) kept receiving
         // workspace-wide events — including full message content — for up to 30 days.
         if (userId) {
-          const current = await User.findById(userId).select('tokenVersion isActive workspaceId').lean();
+          const current = await User.findById(userId).select('tokenVersion isActive workspaceId role').lean();
           if (!current || current.workspaceId.toString() !== workspaceId || (current.tokenVersion ?? 0) !== (tokenVersion ?? 0) || current.isActive === false) {
             socket.close(1008, 'Unauthorized');
             return;
           }
         }
 
+        const workspace = await Workspace.findById(workspaceId).select('status').lean();
+        if (!workspace || workspace.status === 'suspended' || socket.readyState !== 1) { socket.close(1008, 'Unauthorized'); return; }
         this.addClient(workspaceId, socket);
         if (userId) this.addUserClient(userId, socket);
         this.socketMeta.set(socket, { userId, role });
@@ -97,7 +104,20 @@ export class WebSocketGateway {
           } catch { /* ignore malformed */ }
         });
 
+        let checking = false;
+        const expiry = setTimeout(() => this.disconnectSocket(socket), Math.max(1, Math.min(expiresAt - Date.now(), 15 * 60_000)));
+        expiry.unref();
+        const recheck = setInterval(async () => {
+          if (checking) return; checking = true;
+          try {
+            const [current, ws] = await Promise.all([User.findById(userId).select('tokenVersion isActive workspaceId').lean(), Workspace.findById(workspaceId).select('status').lean()]);
+            if (!current || !current.isActive || String(current.workspaceId) !== workspaceId || (current.tokenVersion ?? 0) !== (tokenVersion ?? 0) || !ws || ws.status === 'suspended') this.disconnectSocket(socket);
+          } catch { this.disconnectSocket(socket); }
+          finally { checking = false; }
+        }, 30_000);
+        recheck.unref();
         socket.on('close', () => {
+          clearTimeout(expiry); clearInterval(recheck);
           this.removeClient(workspaceId, socket);
           if (userId) this.removeUserClient(userId, socket);
           this.socketMeta.delete(socket);
@@ -105,6 +125,24 @@ export class WebSocketGateway {
         });
       }
     );
+  }
+
+  private disconnectSocket(socket: WebSocket): void {
+    const userId = this.socketMeta.get(socket)?.userId;
+    for (const [workspaceId, clients] of this.rooms) if (clients.has(socket)) this.removeClient(workspaceId, socket);
+    if (userId) this.removeUserClient(userId, socket);
+    this.socketMeta.delete(socket); socket.close(1008, 'Session expired');
+  }
+
+  disconnectUser(userId: string): void {
+    for (const socket of [...(this.userSockets.get(userId) ?? [])]) this.disconnectSocket(socket);
+  }
+
+  disconnectWorkspace(workspaceId: string): void {
+    for (const socket of [...(this.rooms.get(workspaceId) ?? [])]) {
+      const userId = this.socketMeta.get(socket)?.userId;
+      if (userId) this.disconnectUser(userId); else { this.removeClient(workspaceId, socket); socket.close(1008, 'Workspace unavailable'); }
+    }
   }
 
   broadcastToWorkspace(workspaceId: string, type: string, data: Record<string, unknown>): void {
@@ -142,9 +180,8 @@ export class WebSocketGateway {
       const meta = this.socketMeta.get(client);
       const role = meta?.role;
       const canSee =
-        role === 'owner' || role === 'admin' || !role || // unknown role: fail open to avoid breaking older tokens
-        !assignedAgentId ||
-        meta?.userId === assignedAgentId;
+        role === 'owner' || role === 'admin' ||
+        ((role === 'agent' || role === 'viewer') && (!assignedAgentId || meta?.userId === assignedAgentId));
       if (canSee) client.send(payload);
     }
   }

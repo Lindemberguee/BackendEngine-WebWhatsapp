@@ -1,3 +1,5 @@
+import { accountMembershipFilter } from './account.service';
+import { requireHumanSession } from '../auth/authenticate';
 import type { FastifyInstance } from 'fastify';
 import {
   registerWorkspace, loginUser, getUserById, updateProfile, changeOwnPassword,
@@ -6,9 +8,11 @@ import {
 import { saveAvatar, avatarUrlFor, AvatarError } from './avatar.service';
 import { notify } from '../notifications/notification.service';
 import type { WebSocketGateway } from '../../ws/gateway';
-import { Avatar } from '../../db/models';
+import { Avatar, User } from '../../db/models';
 import { safeEqual } from '../../shared/crypto';
 import { clearSessionCookies, issueSession, issueWsTicket, refreshSession, revokeAllUserSessions, revokeSession } from './session.service';
+import { ResetEmailNotConfiguredError } from './resend';
+import { requestPasswordReset, resetPasswordWithToken } from './password-reset.service';
 
 function toMeResponse(user: NonNullable<Awaited<ReturnType<typeof getUserById>>>) {
   return {
@@ -40,7 +44,7 @@ export async function authRoutes(fastify: FastifyInstance, opts: { wsGateway: We
       await issueSession(fastify, reply, user);
       return reply.status(201).send({ user: { id: user._id, name: user.name, email: user.email, role: user.role, workspaceId } });
     } catch (err) {
-      return reply.status(409).send({ error: (err as Error).message });
+      return reply.status((err as { statusCode?: number }).statusCode ?? 409).send({ error: (err as Error).message });
     }
   });
 
@@ -67,21 +71,40 @@ export async function authRoutes(fastify: FastifyInstance, opts: { wsGateway: We
     }
   });
 
-  // POST /api/auth/forgot-password
-  // Always responds with the same generic message so we never reveal whether an
-  // email is registered (enumeration protection). NOTE: actual email delivery is
-  // not wired yet — it requires an email provider (SMTP/Resend/SES). Until then this
-  // endpoint validates input and no-ops; the reset link is not sent.
+  // Keep one response for registered and unregistered accounts so this route cannot
+  // be used to enumerate account emails.
   fastify.post('/forgot-password', bruteForceGuard, async (request, reply) => {
-    const { email } = request.body as { email?: string };
-    if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
-      return reply.status(400).send({ error: 'E-mail inválido' });
+    const { email } = (request.body ?? {}) as { email?: unknown };
+    if (typeof email !== 'string' || email.length > 254 || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email.trim())) {
+      return reply.status(400).send({ error: 'E-mail inv\u00e1lido' });
     }
-    fastify.log.warn('[auth] forgot-password requested but email delivery is not configured');
-    // TODO: generate a short-lived reset token, persist it, and email the reset link.
-    return reply.send({ message: 'Se este e-mail estiver cadastrado, você receberá as instruções.' });
+    try {
+      await requestPasswordReset(email);
+    } catch (error) {
+      if (error instanceof ResetEmailNotConfiguredError) {
+        fastify.log.warn('[auth] password reset email configuration is incomplete');
+        return reply.status(503).send({ error: 'Recupera\u00e7\u00e3o de senha indispon\u00edvel. Entre em contato com o suporte.' });
+      }
+      // Keep the response independent of account existence and provider status.
+      fastify.log.error({ err: error }, '[auth] password reset email request failed');
+    }
+    return reply.status(202).send({ message: 'Se o e-mail estiver cadastrado e o servi\u00e7o de envio estiver dispon\u00edvel, voc\u00ea receber\u00e1 um link para redefinir a senha.' });
   });
 
+  fastify.post('/reset-password', async (request, reply) => {
+    const { token, newPassword } = (request.body ?? {}) as { token?: unknown; newPassword?: unknown };
+    if (typeof token !== 'string' || token.length < 32 || token.length > 128) return reply.status(400).send({ error: 'Link inv\u00e1lido ou expirado' });
+    if (typeof newPassword !== 'string' || newPassword.length < 8 || newPassword.length > 72) {
+      return reply.status(400).send({ error: 'A senha deve ter entre 8 e 72 caracteres' });
+    }
+    try {
+      const userIds = await resetPasswordWithToken(token, newPassword);
+      for (const userId of userIds) opts.wsGateway.disconnectUser(userId);
+      return reply.send({ ok: true });
+    } catch {
+      return reply.status(400).send({ error: 'Link inv\u00e1lido ou expirado' });
+    }
+  });
   // POST /api/auth/refresh  (requires valid JWT — re-issues with fresh expiry)
   fastify.post('/refresh', async (request, reply) => {
     const refreshed = await refreshSession(fastify, reply, request.cookies.ww_refresh);
@@ -95,13 +118,13 @@ export async function authRoutes(fastify: FastifyInstance, opts: { wsGateway: We
   // POST /api/auth/ws-ticket  (requires auth) — mints a 30s single-purpose token
   // for the WS handshake, fetched over this already-cookie-authenticated call
   // and passed as ?ticket= instead. See issueWsTicket() for why this exists.
-  fastify.post('/ws-ticket', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+  fastify.post('/ws-ticket', { preHandler: [fastify.authenticate, requireHumanSession] }, async (request, reply) => {
     const { sub, workspaceId, role, tokenVersion } = request.user as { sub: string; workspaceId: string; role: string; tokenVersion?: number };
-    return reply.send({ ticket: issueWsTicket(fastify, { sub, workspaceId, role, tokenVersion }) });
+    return reply.send({ ticket: issueWsTicket(fastify, { sub, workspaceId, role, tokenVersion, exp: request.user.exp }) });
   });
 
   // GET /api/auth/me  (requires auth)
-  fastify.get('/me', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+  fastify.get('/me', { preHandler: [fastify.authenticate, requireHumanSession] }, async (request, reply) => {
     const { sub } = request.user as { sub: string };
     const user = await getUserById(sub);
     if (!user) return reply.status(404).send({ error: 'Usuário não encontrado' });
@@ -109,7 +132,7 @@ export async function authRoutes(fastify: FastifyInstance, opts: { wsGateway: We
   });
 
   // PATCH /api/auth/me  (self-service profile edit — never role/email/password)
-  fastify.patch('/me', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+  fastify.patch('/me', { preHandler: [fastify.authenticate, requireHumanSession] }, async (request, reply) => {
     const { sub, workspaceId } = request.user as { sub: string; workspaceId: string };
     const body = request.body as {
       name?: string; avatarUrl?: string; phone?: string; timezone?: string; language?: string;
@@ -164,7 +187,7 @@ export async function authRoutes(fastify: FastifyInstance, opts: { wsGateway: We
   });
 
   // POST /api/auth/me/password  (self-service password change)
-  fastify.post('/me/password', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+  fastify.post('/me/password', { preHandler: [fastify.authenticate, requireHumanSession] }, async (request, reply) => {
     const { sub } = request.user as { sub: string };
     const { currentPassword, newPassword } = request.body as { currentPassword?: string; newPassword?: string };
     if (!currentPassword || !newPassword) return reply.status(400).send({ error: 'Informe a senha atual e a nova senha' });
@@ -177,15 +200,19 @@ export async function authRoutes(fastify: FastifyInstance, opts: { wsGateway: We
     // re-issue a fresh token for THIS session so the caller isn't logged out too.
     const user = await getUserById(sub);
     if (!user) return reply.status(401).send({ error: 'Sessão expirada — faça login novamente' });
+    const caller = await getUserById(sub);
+    if (caller) for (const id of await User.find(accountMembershipFilter(caller)).distinct('_id')) opts.wsGateway.disconnectUser(String(id));
     await revokeAllUserSessions(sub);
     await issueSession(fastify, reply, user, request.cookies.ww_refresh);
     return reply.send({ ok: true });
   });
 
   // POST /api/auth/me/logout-other-sessions  (invalidate every JWT except the caller's, which is re-issued)
-  fastify.post('/me/logout-other-sessions', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+  fastify.post('/me/logout-other-sessions', { preHandler: [fastify.authenticate, requireHumanSession] }, async (request, reply) => {
     const { sub } = request.user as { sub: string };
     await bumpTokenVersion(sub);
+    const caller = await getUserById(sub);
+    if (caller) for (const id of await User.find(accountMembershipFilter(caller)).distinct('_id')) opts.wsGateway.disconnectUser(String(id));
     const user = await getUserById(sub);
     if (!user) return reply.status(401).send({ error: 'Sessão expirada — faça login novamente' });
     await revokeAllUserSessions(sub);
@@ -200,13 +227,13 @@ export async function authRoutes(fastify: FastifyInstance, opts: { wsGateway: We
   });
 
   // GET /api/auth/me/stats  (personal performance snapshot)
-  fastify.get('/me/stats', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+  fastify.get('/me/stats', { preHandler: [fastify.authenticate, requireHumanSession] }, async (request, reply) => {
     const { sub, workspaceId } = request.user as { sub: string; workspaceId: string };
     return reply.send(await getMyStats(workspaceId, sub));
   });
 
   // GET /api/auth/me/activity  (self-scoped audit log — any role, unlike GET /api/audit)
-  fastify.get('/me/activity', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+  fastify.get('/me/activity', { preHandler: [fastify.authenticate, requireHumanSession] }, async (request, reply) => {
     const { sub, workspaceId } = request.user as { sub: string; workspaceId: string };
     const { page = '1', limit = '15' } = request.query as { page?: string; limit?: string };
     return reply.send(await getMyActivity(workspaceId, sub, Math.max(1, Number(page) || 1), Math.min(50, Number(limit) || 15)));

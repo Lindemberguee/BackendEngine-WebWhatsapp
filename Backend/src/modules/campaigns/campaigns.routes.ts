@@ -1,3 +1,4 @@
+import { pagination, pageMeta } from '../../shared/pagination';
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import type { FastifyInstance } from 'fastify';
 import { Types } from 'mongoose';
@@ -86,8 +87,9 @@ export async function campaignsRoutes(fastify: FastifyInstance, opts: { wsGatewa
   // GET /api/campaigns
   fastify.get('/', auth, async (request, reply) => {
     const { workspaceId } = request.user as { workspaceId: string };
-    const campaigns = await Campaign.find({ workspaceId }).sort({ createdAt: -1 });
-    return reply.send({ data: campaigns.map((c) => c.toJSON()) });
+    const { page, limit, skip } = pagination(request.query);
+    const [campaigns, total] = await Promise.all([Campaign.find({ workspaceId }).sort({ createdAt: -1, _id: -1 }).skip(skip).limit(limit), Campaign.countDocuments({ workspaceId })]);
+    return reply.send({ data: campaigns.map((c) => c.toJSON()), meta: pageMeta(page, limit, total) });
   });
 
   // POST /api/campaigns/audience-preview — count (and a small sample) without creating anything

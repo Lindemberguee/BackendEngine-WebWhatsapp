@@ -9,9 +9,9 @@ export function scopeConversationFilter(
   filter: Record<string, unknown>,
   actor: { role: string; sub: string }
 ): Record<string, unknown> {
-  if (actor.role !== 'agent' && actor.role !== 'viewer') return filter;
+  if (actor.role === 'owner' || actor.role === 'admin') return filter;
+  if (actor.role !== 'agent' && actor.role !== 'viewer') return { $and: [filter, { _id: { $exists: false } }] };
   return {
-    ...filter,
-    $or: [{ assignedAgentId: actor.sub }, { assignedAgentId: null }, { assignedAgentId: { $exists: false } }],
+    $and: [filter, { $or: [{ assignedAgentId: actor.sub }, { assignedAgentId: null }, { assignedAgentId: { $exists: false } }] }],
   };
 }

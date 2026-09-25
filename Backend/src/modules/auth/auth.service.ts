@@ -1,6 +1,10 @@
+import { ensureDefaultPipeline } from '../crm/crm.service';
+import { z } from 'zod';
+import { Account } from '../../db/models/Account.model';
+import { ensureAccount, accountMembershipFilter } from './account.service';
 import { Types } from 'mongoose';
 import bcrypt from 'bcrypt';
-import { User, Workspace, Conversation, Message, Lead, AuditLog } from '../../db/models';
+import { User, Workspace, Conversation, Message, Lead, AuditLog, Subscription, Pipeline } from '../../db/models';
 import type { IUser } from '../../db/models';
 import { getOrCreateSubscription } from '../billing/billing.service';
 
@@ -11,7 +15,13 @@ export async function registerWorkspace(data: {
   password: string;
   acceptedTerms: boolean;
 }): Promise<{ user: IUser; workspaceId: string }> {
-  if (!data.acceptedTerms) throw new Error('É necessário aceitar os Termos de Uso e a Política de Privacidade');
+  const parsed = z.object({
+    workspaceName: z.string().trim().min(1).max(100), ownerName: z.string().trim().min(1).max(100),
+    email: z.string().trim().toLowerCase().email().max(254), password: z.string().min(8).max(72),
+    acceptedTerms: z.literal(true, { error: 'É necessário aceitar os Termos de Uso e a Política de Privacidade' }),
+  }).safeParse(data);
+  if (!parsed.success) throw Object.assign(new Error(parsed.error.issues[0].message), { statusCode: 400 });
+  data = parsed.data;
 
   // Must match the exact normalization the schema applies on save (lowercase + trim) —
   // comparing the raw client string here let "Victim@Corp.com" sail past this check
@@ -33,6 +43,10 @@ export async function registerWorkspace(data: {
   const finalSlug = slugExists ? `${slug}-${Date.now()}` : slug;
 
   // Create workspace first (ownerId will be updated after user creation)
+  const accountId = new Types.ObjectId();
+  const account = await Account.create({ _id: accountId, email: normalizedEmail, signupEmail: normalizedEmail, passwordHash: await bcrypt.hash(data.password, 12) });
+  let createdWorkspaceId: Types.ObjectId | undefined;
+  try {
   const workspace = await Workspace.create({
     name: data.workspaceName,
     slug: finalSlug,
@@ -40,7 +54,9 @@ export async function registerWorkspace(data: {
   });
 
   // Pass the plain password — the User pre('save') hook hashes it once.
+  createdWorkspaceId = workspace._id as Types.ObjectId;
   const user = await User.create({
+    accountId: account._id,
     workspaceId: workspace._id,
     name: data.ownerName,
     email: normalizedEmail,
@@ -55,20 +71,36 @@ export async function registerWorkspace(data: {
 
   // Starts a 14-day Pro trial (no card required) and syncs workspace.plan — see billing.service.ts
   await getOrCreateSubscription(workspace._id.toString());
+  await ensureDefaultPipeline(workspace._id.toString());
 
   return { user, workspaceId: workspace._id.toString() };
+  } catch (error) {
+    // Compensation is restricted to resources created by this attempt.
+    if (createdWorkspaceId) {
+      await User.deleteMany({ workspaceId: createdWorkspaceId, accountId });
+      await Subscription.deleteMany({ workspaceId: createdWorkspaceId });
+      await Pipeline.deleteMany({ workspaceId: createdWorkspaceId });
+      await Workspace.deleteOne({ _id: createdWorkspaceId });
+    }
+    await Account.deleteOne({ _id: accountId });
+    throw error;
+  }
 }
 
 export async function loginUser(email: string, password: string): Promise<IUser> {
+  if (typeof email !== 'string' || typeof password !== 'string' || password.length > 72) throw new Error('Credenciais inválidas');
   const users = await User.find({ email: email.trim().toLowerCase(), isActive: true });
   let hasValidCredential = false;
   for (const user of users) {
-    if (!(await user.comparePassword(password))) continue;
+    const account = user.accountId ? await Account.findById(user.accountId) : null;
+    const hash = user.accountId ? account?.passwordHash : user.passwordHash;
+    if (!hash || !(await bcrypt.compare(password, hash))) continue;
     hasValidCredential = true;
 
     const workspace = await Workspace.findById(user.workspaceId).select('status').lean();
     if (!workspace || workspace.status === 'suspended') continue;
 
+    await ensureAccount(user);
     await User.updateOne({ _id: user._id }, { lastLoginAt: new Date() });
     return user;
   }
@@ -99,24 +131,26 @@ export async function updateProfile(userId: string, patch: {
 export async function changeOwnPassword(userId: string, currentPassword: string, newPassword: string): Promise<void> {
   const user = await User.findById(userId);
   if (!user) throw new Error('Usuário não encontrado');
-  const valid = await user.comparePassword(currentPassword);
+  const account = await ensureAccount(user);
+  const valid = await bcrypt.compare(currentPassword, account.passwordHash);
   if (!valid) throw new Error('Senha atual incorreta');
-  if (newPassword.length < 8) throw new Error('A nova senha deve ter pelo menos 8 caracteres');
+  if (typeof newPassword !== 'string' || newPassword.length < 8 || newPassword.length > 72) throw new Error('A nova senha deve ter pelo menos 8 caracteres');
   // A person has one credential across every workspace they can switch to. Keep
   // all identity records aligned; otherwise an older workspace record could still
   // accept the previous password or its older JWTs.
   const passwordHash = await bcrypt.hash(newPassword, 12);
+  await Account.updateOne({ _id: account._id }, { $set: { passwordHash } });
   await User.updateMany(
-    { email: user.email },
+    accountMembershipFilter(user),
     { $set: { passwordHash }, $inc: { tokenVersion: 1 } },
   );
 }
 
 /** Bumps tokenVersion so every previously-issued JWT stops validating — "log out other sessions". */
 export async function bumpTokenVersion(userId: string): Promise<number> {
-  const user = await User.findById(userId).select('email');
+  const user = await User.findById(userId).select('accountId');
   if (!user) return 0;
-  await User.updateMany({ email: user.email }, { $inc: { tokenVersion: 1 } });
+  await User.updateMany(accountMembershipFilter(user), { $inc: { tokenVersion: 1 } });
   const current = await User.findById(userId).select('tokenVersion');
   return current?.tokenVersion ?? 0;
 }

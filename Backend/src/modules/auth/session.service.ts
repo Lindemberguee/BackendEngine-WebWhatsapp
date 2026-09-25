@@ -1,3 +1,4 @@
+import { accountMembershipFilter } from './account.service';
 import { createHash, randomBytes } from 'crypto';
 import type { FastifyInstance, FastifyReply } from 'fastify';
 import { AuthSession, User, Workspace } from '../../db/models';
@@ -14,19 +15,7 @@ function hashRefreshToken(token: string): string {
 }
 
 function cookieOptions(maxAge: number) {
-  // The frontend and this API are on different registrable domains today
-  // (e.g. a Vercel preview/production domain talking to api.<ourdomain>), which
-  // makes every request — including the WS gateway's handshake — cross-site.
-  // SameSite=Lax cookies are never attached to a cross-site subresource request
-  // (fetch or WebSocket), only to a top-level navigation, so the WS handshake
-  // reached the server with no cookie at all and got closed as unauthorized
-  // every time. SameSite=None is the standard fix for a split-domain SPA+API —
-  // it requires Secure (HTTPS, already the case in production) and is safe
-  // here because CORS is locked to an explicit origin allowlist with
-  // credentials (see server.ts), not a wildcard: an arbitrary third-party site
-  // can't complete the CORS preflight to ride this cookie, which is the actual
-  // CSRF gate. Left as Lax outside production, where Secure (and therefore
-  // None) isn't available and everything runs same-origin on localhost anyway.
+  // Cross-site cookies require the explicit Origin guard registered in server.ts.
   const secure = process.env.NODE_ENV === 'production';
   const sameSite: 'none' | 'lax' = secure ? 'none' : 'lax';
   return {
@@ -67,10 +56,10 @@ export function clearSessionCookies(reply: FastifyReply): void {
  */
 export function issueWsTicket(
   fastify: FastifyInstance,
-  claims: { sub: string; workspaceId: string; role: string; tokenVersion?: number },
+  claims: { sub: string; workspaceId: string; role: string; tokenVersion?: number; exp?: number },
 ): string {
   return fastify.jwt.sign(
-    { sub: claims.sub, workspaceId: claims.workspaceId, role: claims.role, tokenVersion: claims.tokenVersion ?? 0 },
+    { sub: claims.sub, workspaceId: claims.workspaceId, role: claims.role, tokenVersion: claims.tokenVersion ?? 0, purpose: 'ws', sessionExpiresAt: claims.exp ?? Math.floor(Date.now() / 1000) + ACCESS_TTL_SECONDS },
     { expiresIn: WS_TICKET_TTL_SECONDS },
   );
 }
@@ -90,6 +79,7 @@ export async function issueSession(
 
   const refreshToken = randomBytes(48).toString('base64url');
   await AuthSession.create({
+    tokenVersion: user.tokenVersion ?? 0,
     userId: user._id,
     workspaceId: user.workspaceId,
     refreshTokenHash: hashRefreshToken(refreshToken),
@@ -97,7 +87,7 @@ export async function issueSession(
   });
 
   const accessToken = fastify.jwt.sign(
-    { sub: user._id!.toString(), workspaceId: user.workspaceId.toString(), role: user.role, tokenVersion: user.tokenVersion ?? 0 },
+    { sub: user._id!.toString(), workspaceId: user.workspaceId.toString(), role: user.role, tokenVersion: user.tokenVersion ?? 0, purpose: 'access' },
     { expiresIn: ACCESS_TTL_SECONDS },
   );
   setSessionCookies(reply, accessToken, refreshToken);
@@ -105,21 +95,21 @@ export async function issueSession(
 
 export async function refreshSession(fastify: FastifyInstance, reply: FastifyReply, refreshToken?: string): Promise<boolean> {
   if (!refreshToken) return false;
-  const session = await AuthSession.findOne({
+  const session = await AuthSession.findOneAndUpdate({
     refreshTokenHash: hashRefreshToken(refreshToken),
     revokedAt: { $exists: false },
     expiresAt: { $gt: new Date() },
-  });
+  }, { $set: { revokedAt: new Date() } }, { new: false });
   if (!session) return false;
 
   const user = await User.findById(session.userId);
   const workspace = user ? await Workspace.findById(user.workspaceId).select('status').lean() : null;
-  if (!user || !user.isActive || !workspace || workspace.status === 'suspended') {
+  if (!user || !user.isActive || (session.tokenVersion ?? 0) !== (user.tokenVersion ?? 0) || !workspace || workspace.status === 'suspended') {
     await AuthSession.updateOne({ _id: session._id }, { $set: { revokedAt: new Date() } });
     return false;
   }
 
-  await issueSession(fastify, reply, user, refreshToken);
+  await issueSession(fastify, reply, user);
   return true;
 }
 
@@ -132,8 +122,8 @@ export async function revokeSession(refreshToken?: string): Promise<void> {
 }
 
 export async function revokeAllUserSessions(userId: string): Promise<void> {
-  const user = await User.findById(userId).select('email').lean();
+  const user = await User.findById(userId).select('accountId').lean();
   if (!user) return;
-  const userIds = await User.find({ email: user.email }).distinct('_id');
+  const userIds = await User.find(accountMembershipFilter(user)).distinct('_id');
   await AuthSession.updateMany({ userId: { $in: userIds }, revokedAt: { $exists: false } }, { $set: { revokedAt: new Date() } });
 }

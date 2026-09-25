@@ -1,7 +1,11 @@
+import { Readable } from 'stream';
+import { ensureDefaultPipeline } from '../crm/crm.service';
+import { ensureAccount, accountMembershipFilter, linkLegacyMembership } from '../auth/account.service';
+import { requireHumanSession } from '../auth/authenticate';
 import type { FastifyInstance } from 'fastify';
 import { Types } from 'mongoose';
 import {
-  Workspace, User, Conversation, Message, Contact, Lead, Pipeline, Campaign, AuditLog,
+  Workspace, User, Conversation, Message, Contact, Lead, Pipeline, Campaign, AuditLog, Subscription,
 } from '../../db/models';
 import { getOrCreateSubscription, assertCanCreateWorkspace } from '../billing/billing.service';
 import { notify } from '../notifications/notification.service';
@@ -13,10 +17,10 @@ import { issueSession } from '../auth/session.service';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-async function buildWorkspacePayload(ws: { _id: unknown; name: string; slug: string; plan: string; logoUrl?: string; ownerId: unknown; createdAt: Date }) {
+async function buildWorkspacePayload(ws: { _id: unknown; name: string; slug: string; plan: string; logoUrl?: string; ownerId: unknown; createdAt: Date }, counts?: [number, number, number]) {
   const oid = ws._id instanceof Types.ObjectId ? ws._id : new Types.ObjectId(String(ws._id));
   const id = oid.toString();
-  const [memberCount, conversationCount, monthlyMessageCount] = await Promise.all([
+  const [memberCount, conversationCount, monthlyMessageCount] = counts ?? await Promise.all([
     User.countDocuments({ workspaceId: oid }),
     Conversation.countDocuments({ workspaceId: oid }),
     Message.countDocuments({
@@ -52,7 +56,7 @@ function slugify(text: string): string {
 
 export async function workspacesRoutes(fastify: FastifyInstance, opts: { wsGateway: WebSocketGateway }): Promise<void> {
   // GET /api/workspaces  — list all workspaces the authenticated user belongs to
-  fastify.get('/', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+  fastify.get('/', { preHandler: [fastify.authenticate, requireHumanSession] }, async (request, reply) => {
     const { sub, workspaceId } = request.user as { sub: string; workspaceId: string };
 
     // Find the caller's user record to get their email
@@ -60,7 +64,7 @@ export async function workspacesRoutes(fastify: FastifyInstance, opts: { wsGatew
     if (!me) return reply.status(401).send({ error: 'Usuário não encontrado' });
 
     // Find all user records with the same email (across all workspaces)
-    const allUsers = await User.find({ email: me.email }).lean();
+    const allUsers = await User.find({ ...accountMembershipFilter(me), isActive: true }).lean();
     const wsIds = allUsers.map((u) => u.workspaceId);
 
     const workspaces = await Workspace.find({ _id: { $in: wsIds } }).lean();
@@ -73,23 +77,32 @@ export async function workspacesRoutes(fastify: FastifyInstance, opts: { wsGatew
       return a.createdAt.getTime() - b.createdAt.getTime();
     });
 
-    const data = await Promise.all(workspaces.map(buildWorkspacePayload));
+    const ids = workspaces.map(workspace => workspace._id);
+    const match = { workspaceId: { $in: ids } };
+    const [members, conversations, messages] = await Promise.all([
+      User.aggregate<{ _id: Types.ObjectId; total: number }>([{ $match: match }, { $group: { _id: '$workspaceId', total: { $sum: 1 } } }]),
+      Conversation.aggregate<{ _id: Types.ObjectId; total: number }>([{ $match: match }, { $group: { _id: '$workspaceId', total: { $sum: 1 } } }]),
+      Message.aggregate<{ _id: Types.ObjectId; total: number }>([{ $match: { ...match, createdAt: { $gte: new Date(new Date().getFullYear(), new Date().getMonth(), 1) } } }, { $group: { _id: '$workspaceId', total: { $sum: 1 } } }]),
+    ]);
+    const maps = [members, conversations, messages].map(rows => new Map(rows.map(row => [String(row._id), row.total])));
+    const data = await Promise.all(workspaces.map(workspace => buildWorkspacePayload(workspace, maps.map(map => map.get(String(workspace._id)) ?? 0) as [number, number, number])));
     return reply.send({ data });
   });
 
   // GET /api/workspaces/current — current workspace with live stats
-  fastify.get('/current', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+  fastify.get('/current', { preHandler: [fastify.authenticate, requireHumanSession] }, async (request, reply) => {
     const { workspaceId } = request.user as { workspaceId: string };
     if (!Types.ObjectId.isValid(workspaceId)) return reply.status(400).send({ error: 'workspaceId inválido' });
 
     const ws = await Workspace.findById(workspaceId).lean();
     if (!ws) return reply.status(404).send({ error: 'Workspace não encontrado' });
+    if ('status' in ws && ws.status === 'suspended') return reply.status(403).send({ error: 'Workspace suspenso' });
 
     return reply.send({ data: await buildWorkspacePayload(ws) });
   });
 
   // GET /api/workspaces/:id
-  fastify.get('/:id', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+  fastify.get('/:id', { preHandler: [fastify.authenticate, requireHumanSession] }, async (request, reply) => {
     const { id } = request.params as { id: string };
     const { sub } = request.user as { sub: string };
 
@@ -97,7 +110,7 @@ export async function workspacesRoutes(fastify: FastifyInstance, opts: { wsGatew
 
     // Verify caller belongs to this workspace
     const me = await User.findById(sub).lean();
-    const user = me ? await User.findOne({ email: me.email, workspaceId: new Types.ObjectId(id) }).lean() : null;
+    const user = me ? await User.findOne({ ...accountMembershipFilter(me), isActive: true, workspaceId: new Types.ObjectId(id) }).lean() : null;
     if (!user) return reply.status(403).send({ error: 'Sem acesso a este workspace' });
 
     const ws = await Workspace.findById(id).lean();
@@ -107,7 +120,7 @@ export async function workspacesRoutes(fastify: FastifyInstance, opts: { wsGatew
   });
 
   // POST /api/workspaces — create new workspace
-  fastify.post('/', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+  fastify.post('/', { preHandler: [fastify.authenticate, requireHumanSession] }, async (request, reply) => {
     const { sub } = request.user as { sub: string };
     const { name, slug } = request.body as { name?: string; slug?: string };
 
@@ -120,9 +133,10 @@ export async function workspacesRoutes(fastify: FastifyInstance, opts: { wsGatew
     }
 
     // Get creator's info
-    const creator = await User.findById(sub).lean();
+    const creator = await User.findById(sub);
     if (!creator) return reply.status(401).send({ error: 'Usuário não encontrado' });
 
+    const account = await ensureAccount(creator);
     const finalSlug = slug?.trim() || slugify(name.trim());
 
     // Check slug uniqueness
@@ -138,14 +152,17 @@ export async function workspacesRoutes(fastify: FastifyInstance, opts: { wsGatew
       ownerId: new Types.ObjectId(sub),
     });
     // Starts its own 14-day Pro trial — each workspace is billed independently for now.
+    try {
     await getOrCreateSubscription(ws._id.toString());
+    await ensureDefaultPipeline(ws._id.toString());
 
     // Create owner user record in new workspace
     const owner = new User({
+      accountId: account._id,
       workspaceId: ws._id,
       name: creator.name,
       email: creator.email,
-      passwordHash: creator.passwordHash,
+      passwordHash: account.passwordHash,
       role: 'owner',
       avatarUrl: creator.avatarUrl,
       isActive: true,
@@ -154,13 +171,22 @@ export async function workspacesRoutes(fastify: FastifyInstance, opts: { wsGatew
     // than passing it through the model hook a second time.
     owner.$locals.skipPasswordHash = true;
     await owner.save();
+    await Workspace.updateOne({ _id: ws._id }, { $set: { ownerId: owner._id } });
+    ws.ownerId = owner._id as Types.ObjectId;
 
     const data = await buildWorkspacePayload(ws.toObject());
     return reply.status(201).send({ data });
+    } catch (error) {
+      await User.deleteMany({ workspaceId: ws._id, accountId: account._id });
+      await Subscription.deleteMany({ workspaceId: ws._id });
+      await Pipeline.deleteMany({ workspaceId: ws._id });
+      await Workspace.deleteOne({ _id: ws._id });
+      throw error;
+    }
   });
 
   // PATCH /api/workspaces/:id — update workspace settings
-  fastify.patch('/:id', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+  fastify.patch('/:id', { preHandler: [fastify.authenticate, requireHumanSession] }, async (request, reply) => {
     const { id } = request.params as { id: string };
     const { workspaceId, role } = request.user as { workspaceId: string; role: string };
 
@@ -168,7 +194,9 @@ export async function workspacesRoutes(fastify: FastifyInstance, opts: { wsGatew
     if (id !== workspaceId) return reply.status(403).send({ error: 'Sem acesso' });
     if (!['owner', 'admin'].includes(role)) return reply.status(403).send({ error: 'Sem permissão' });
 
+    if (!request.body || typeof request.body !== 'object' || Object.keys(request.body).some(key => !['name', 'logoUrl'].includes(key))) return reply.status(400).send({ error: 'Campos permitidos: name e logoUrl' });
     const { name, logoUrl } = request.body as { name?: string; logoUrl?: string };
+    if ((name !== undefined && (typeof name !== 'string' || !name.trim())) || (logoUrl !== undefined && typeof logoUrl !== 'string')) return reply.status(400).send({ error: 'Configuração inválida' });
     const updates: Record<string, unknown> = {};
     if (name?.trim()) updates.name = name.trim();
     if (typeof logoUrl === 'string') updates.logoUrl = logoUrl;
@@ -193,7 +221,7 @@ export async function workspacesRoutes(fastify: FastifyInstance, opts: { wsGatew
   });
 
   // GET /api/workspaces/:id/theme — any member can read (needed to render the app)
-  fastify.get('/:id/theme', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+  fastify.get('/:id/theme', { preHandler: [fastify.authenticate, requireHumanSession] }, async (request, reply) => {
     const { id } = request.params as { id: string };
     const { workspaceId } = request.user as { workspaceId: string };
 
@@ -208,7 +236,7 @@ export async function workspacesRoutes(fastify: FastifyInstance, opts: { wsGatew
   });
 
   // PATCH /api/workspaces/:id/theme — owner/admin only, writes settings.theme without touching other settings keys
-  fastify.patch('/:id/theme', { preHandler: [fastify.authenticate, requireRole(['owner', 'admin'])] }, async (request, reply) => {
+  fastify.patch('/:id/theme', { preHandler: [fastify.authenticate, requireHumanSession, requireRole(['owner', 'admin'])] }, async (request, reply) => {
     const { id } = request.params as { id: string };
     const { workspaceId } = request.user as { workspaceId: string };
 
@@ -241,8 +269,17 @@ export async function workspacesRoutes(fastify: FastifyInstance, opts: { wsGatew
     return reply.send({ data: theme });
   });
 
+  fastify.post('/link-legacy', { preHandler: [fastify.authenticate, requireHumanSession], config: { rateLimit: { max: 5, timeWindow: '1 minute' } } }, async (request, reply) => {
+    const body = request.body as { workspaceId?: unknown; password?: unknown };
+    try {
+      const linkedId = await linkLegacyMembership(request.user.sub, body?.workspaceId, body?.password);
+      opts.wsGateway.disconnectUser(linkedId);
+      return reply.send({ ok: true });
+    } catch (error) { return reply.status(400).send({ error: (error as Error).message }); }
+  });
+
   // POST /api/workspaces/switch — switch to another workspace, return new JWT
-  fastify.post('/switch', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+  fastify.post('/switch', { preHandler: [fastify.authenticate, requireHumanSession] }, async (request, reply) => {
     const { sub } = request.user as { sub: string };
     const { workspaceId: targetWsId } = request.body as { workspaceId?: string };
 
@@ -255,7 +292,7 @@ export async function workspacesRoutes(fastify: FastifyInstance, opts: { wsGatew
     if (!me) return reply.status(401).send({ error: 'Usuário não encontrado' });
 
     // Find their user record in the target workspace
-    const targetUser = await User.findOne({ email: me.email, workspaceId: new Types.ObjectId(targetWsId) }).lean();
+    const targetUser = await User.findOne({ ...accountMembershipFilter(me), isActive: true, workspaceId: new Types.ObjectId(targetWsId) }).lean();
     if (!targetUser) return reply.status(403).send({ error: 'Você não pertence a este workspace' });
 
     const ws = await Workspace.findById(targetWsId).lean();
@@ -288,7 +325,7 @@ export async function workspacesRoutes(fastify: FastifyInstance, opts: { wsGatew
   // the account means shutting down the whole business's workspace, not just one member
   // (non-owner members are already removable individually via /api/team). A 30-day grace
   // period gives room to change your mind before the cascade in workspace-deletion-scheduler.ts runs.
-  fastify.post('/:id/delete-request', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+  fastify.post('/:id/delete-request', { preHandler: [fastify.authenticate, requireHumanSession] }, async (request, reply) => {
     const { id } = request.params as { id: string };
     const { sub, workspaceId, role } = request.user as { sub: string; workspaceId: string; role: string };
     if (id !== workspaceId) return reply.status(403).send({ error: 'Sem acesso' });
@@ -315,7 +352,7 @@ export async function workspacesRoutes(fastify: FastifyInstance, opts: { wsGatew
   });
 
   // POST /api/workspaces/:id/delete-cancel — undo a pending deletion request before the grace period ends
-  fastify.post('/:id/delete-cancel', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+  fastify.post('/:id/delete-cancel', { preHandler: [fastify.authenticate, requireHumanSession] }, async (request, reply) => {
     const { id } = request.params as { id: string };
     const { sub, workspaceId, role } = request.user as { sub: string; workspaceId: string; role: string };
     if (id !== workspaceId) return reply.status(403).send({ error: 'Sem acesso' });
@@ -336,27 +373,36 @@ export async function workspacesRoutes(fastify: FastifyInstance, opts: { wsGatew
   // structured data (no message media — that already lives on WhatsApp's own servers).
   // Fine as a synchronous request for a workspace at this stage of scale; revisit as an
   // async job with file storage if export payloads start timing out.
-  fastify.get('/:id/export', { preHandler: [fastify.authenticate] }, async (request, reply) => {
+  fastify.get('/:id/export', { preHandler: [fastify.authenticate, requireHumanSession] }, async (request, reply) => {
     const { id } = request.params as { id: string };
     const { workspaceId, role } = request.user as { workspaceId: string; role: string };
     if (id !== workspaceId) return reply.status(403).send({ error: 'Sem acesso' });
     if (!['owner', 'admin'].includes(role)) return reply.status(403).send({ error: 'Sem permissão' });
 
-    const [workspace, users, contacts, conversations, messages, leads, pipelines, campaigns] = await Promise.all([
-      Workspace.findById(id).select('name slug plan createdAt').lean(),
-      User.find({ workspaceId: id }).select('name email role createdAt').lean(),
-      Contact.find({ workspaceId: id }).select('name phone email source createdAt').lean(),
-      Conversation.find({ workspaceId: id }).select('name phone status jid createdAt updatedAt').lean(),
-      Message.find({ workspaceId: id }).select('conversationId direction type content.text createdAt').limit(50_000).lean(),
-      Lead.find({ workspaceId: id }).select('title value status pipelineId stageId createdAt').lean(),
-      Pipeline.find({ workspaceId: id }).select('name stages').lean(),
-      Campaign.find({ workspaceId: id }).select('name status stats createdAt').lean(),
-    ]);
-
+    const workspace = await Workspace.findById(id).select('name slug plan createdAt').lean();
+    // Full export with bounded Mongo batches; no silent 50,000-message truncation.
+    const collections = [
+      ['users', User.find({ workspaceId: id }).select('name email role createdAt').sort({ _id: 1 }).lean().cursor({ batchSize: 250 })],
+      ['contacts', Contact.find({ workspaceId: id }).select('name phone email source createdAt').sort({ _id: 1 }).lean().cursor({ batchSize: 250 })],
+      ['conversations', Conversation.find({ workspaceId: id }).select('name phone status jid createdAt updatedAt').sort({ _id: 1 }).lean().cursor({ batchSize: 250 })],
+      ['messages', Message.find({ workspaceId: id }).select('conversationId direction type content.text createdAt').sort({ _id: 1 }).lean().cursor({ batchSize: 250 })],
+      ['leads', Lead.find({ workspaceId: id }).select('title value status pipelineId stageId createdAt').sort({ _id: 1 }).lean().cursor({ batchSize: 250 })],
+      ['pipelines', Pipeline.find({ workspaceId: id }).select('name stages').sort({ _id: 1 }).lean().cursor({ batchSize: 250 })],
+      ['campaigns', Campaign.find({ workspaceId: id }).select('name status stats createdAt').sort({ _id: 1 }).lean().cursor({ batchSize: 250 })],
+    ] as const;
+    const stream = Readable.from((async function* () {
+      try {
+        yield '{"exportedAt":' + JSON.stringify(new Date().toISOString()) + ',"workspace":' + JSON.stringify(workspace);
+        for (const [name, cursor] of collections) {
+          yield ',' + JSON.stringify(name) + ':['; let first = true;
+          for await (const document of cursor) { yield (first ? '' : ',') + JSON.stringify(document); first = false; }
+          yield ']';
+        }
+        yield '}';
+      } finally { await Promise.all(collections.map(([, cursor]) => cursor.close())); }
+    })());
+    request.raw.on('aborted', () => stream.destroy());
     reply.header('Content-Disposition', `attachment; filename="workspace-export-${id}.json"`);
-    return reply.send({
-      exportedAt: new Date().toISOString(),
-      workspace, users, contacts, conversations, messages, leads, pipelines, campaigns,
-    });
+    return reply.type('application/json').send(stream);
   });
 }

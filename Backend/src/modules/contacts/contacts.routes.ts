@@ -1,3 +1,4 @@
+import { scopeConversationFilter } from '../../utils/conversation-visibility';
 ﻿import type { FastifyInstance } from "fastify";
 import { Types } from "mongoose";
 import { Contact, Conversation, Message, AuditLog, User, Lead, CampaignRecipient } from "../../db/models";
@@ -136,11 +137,11 @@ export async function contactsRoutes(fastify: FastifyInstance): Promise<void> {
       if (!contact) return reply.status(404).send({ error: "Contact not found" });
 
       let recentMessages: any[] = [];
-      const conversation = await Conversation.findOne({
+      const conversation = await Conversation.findOne(scopeConversationFilter({
         workspaceId: new Types.ObjectId(workspaceId),
         jid: contact.jid,
         isGroup: false,
-      });
+      }, request.user));
 
       if (conversation) {
         recentMessages = await Message.find({ conversationId: conversation._id }).sort({ createdAt: -1 }).limit(5);
@@ -509,10 +510,10 @@ export async function contactsRoutes(fastify: FastifyInstance): Promise<void> {
 
       if (!contact) return reply.status(404).send({ error: "Contact not found" });
 
-      const conversations = await Conversation.find({
+      const conversations = await Conversation.find(scopeConversationFilter({
         workspaceId: new Types.ObjectId(workspaceId),
         $or: [{ jid: contact.jid }, { contactId: contact._id }],
-      }).sort({ updatedAt: -1 }).limit(20);
+      }, request.user)).sort({ updatedAt: -1 }).limit(20);
 
       reply.send({
         data: conversations.map((c) => ({
@@ -550,10 +551,10 @@ export async function contactsRoutes(fastify: FastifyInstance): Promise<void> {
       if (!contact) return reply.status(404).send({ error: "Contact not found" });
 
       const [conversations, auditEntries] = await Promise.all([
-        Conversation.find({
+        Conversation.find(scopeConversationFilter({
           workspaceId: new Types.ObjectId(workspaceId),
           $or: [{ jid: contact.jid }, { contactId: contact._id }],
-        }).sort({ updatedAt: -1 }).limit(10),
+        }, request.user)).sort({ updatedAt: -1 }).limit(10),
         AuditLog.find({
           workspaceId: new Types.ObjectId(workspaceId),
           "target.type": "contact",

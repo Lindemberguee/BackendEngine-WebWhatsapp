@@ -1,3 +1,4 @@
+import { requireRole } from '../../utils/require-role';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { Types } from 'mongoose';
 import { randomBytes } from 'crypto';
@@ -25,7 +26,7 @@ interface MultipartPart {
 type MultipartRequest = FastifyRequest & { parts(): AsyncIterableIterator<MultipartPart> };
 
 export async function flowAssetsRoutes(fastify: FastifyInstance): Promise<void> {
-  const auth = { preHandler: [fastify.authenticate] };
+  const auth = { preHandler: [fastify.authenticate, requireRole(['owner', 'admin'])] };
 
   // POST /api/flow-assets — multipart/form-data with a single `file`. Returns the
   // absolute public URL to reference from a flow block.

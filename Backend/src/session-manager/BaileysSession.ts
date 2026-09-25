@@ -1,3 +1,4 @@
+import { preparePublicMedia } from '../shared/public-media';
 import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
@@ -589,7 +590,7 @@ export class BaileysSession implements IChannelSession {
    *  media) have no equivalent in the neutral IR and are Baileys-only concepts. */
   async sendRaw(jid: string, content: AnyMessageContent, options?: unknown): Promise<WAMessage | undefined> {
     if (!this.sock) throw new Error('Instance not connected');
-    return this.sock.sendMessage(jid, content, options as Parameters<WASocket['sendMessage']>[2]);
+    return this.sock.sendMessage(jid, await preparePublicMedia(content), options as Parameters<WASocket['sendMessage']>[2]);
   }
 
   /** IChannelSession's neutral entrypoint — translates the channel-neutral IR
@@ -886,7 +887,7 @@ export class BaileysSession implements IChannelSession {
     const sock = this.sock;
     if (!sock) throw new Error('Session not connected');
     return async (j: string, content: AnyMessageContent) => {
-      const result = await sock.sendMessage(j, content as never);
+      const result = await sock.sendMessage(j, await preparePublicMedia(content as never));
       if (result) {
         this.processIncomingMessage(result).catch((err) =>
           logger.warn({ err }, '[flow] failed to store sent message')

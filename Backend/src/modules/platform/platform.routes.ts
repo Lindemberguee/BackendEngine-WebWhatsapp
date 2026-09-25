@@ -1,3 +1,4 @@
+import type { WebSocketGateway } from '../../ws/gateway';
 import { timingSafeEqual } from 'crypto';
 import { Types } from 'mongoose';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
@@ -6,6 +7,7 @@ import type { PricingCategory } from '../../db/models';
 import { getPlan, PLANS } from '../billing/plans.config';
 import { describeMediaStorage, testMediaStorageConnection } from '../../shared/media-storage';
 import { escapeRegex } from '../../shared/string-utils';
+import { consumeSharedPlatformLoginAttempt } from './platform-login-limit.service';
 
 function secureEqual(received: string, expected: string): boolean {
   const a = Buffer.from(received);
@@ -26,8 +28,18 @@ function addDays(date: Date, days: number): Date {
   return new Date(date.getTime() + days * 86_400_000);
 }
 
-export async function platformRoutes(fastify: FastifyInstance): Promise<void> {
+export async function platformRoutes(fastify: FastifyInstance, opts: { wsGateway: WebSocketGateway }): Promise<void> {
   const adminOnly = { preHandler: [platformAuthenticate] };
+
+  // Shared per-account throttle for the Next BFF's platform-admin login. The
+  // email is HMACed before persistence and never appears in this response.
+  fastify.post('/consume-login-attempt', adminOnly, async (request, reply) => {
+    const { email } = (request.body ?? {}) as { email?: unknown };
+    if (typeof email !== 'string' || email.length > 254 || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email.trim())) return reply.status(400).send({ error: 'E-mail inv\u00e1lido' });
+    const retryAfter = await consumeSharedPlatformLoginAttempt(email);
+    if (retryAfter) return reply.header('Retry-After', String(retryAfter)).status(429).send({ error: 'Muitas tentativas. Aguarde e tente novamente.' });
+    return reply.send({ allowed: true });
+  });
 
   fastify.get('/overview', adminOnly, async (_request, reply) => {
     const now = new Date();
@@ -102,7 +114,7 @@ export async function platformRoutes(fastify: FastifyInstance): Promise<void> {
     const update = status === 'suspended' ? { $set: { status, suspendedAt: new Date() } } : { $set: { status }, $unset: { suspendedAt: 1 } };
     const workspace = await Workspace.findByIdAndUpdate(id, update, { new: true });
     if (!workspace) return reply.status(404).send({ error: 'Workspace não encontrado' });
-    if (status === 'suspended') await User.updateMany({ workspaceId: workspace._id }, { $inc: { tokenVersion: 1 } });
+    if (status === 'suspended') { await User.updateMany({ workspaceId: workspace._id }, { $inc: { tokenVersion: 1 } }); opts.wsGateway.disconnectWorkspace(id); }
     request.log.info({ workspaceId: id, status }, '[platform] workspace status changed');
     return reply.send({ data: { id, status: workspace.status, suspendedAt: workspace.suspendedAt?.toISOString() } });
   });

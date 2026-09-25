@@ -1,3 +1,4 @@
+import { requireRole } from '../../utils/require-role';
 import type { FastifyInstance } from 'fastify';
 import { Types } from 'mongoose';
 import { Label, Conversation, Contact } from '../../db/models';
@@ -7,6 +8,7 @@ const HEX_RE = /^#[0-9a-fA-F]{6}$/;
 
 export async function labelsRoutes(fastify: FastifyInstance): Promise<void> {
   const auth = { preHandler: [fastify.authenticate] };
+  const canWrite = { preHandler: [fastify.authenticate, requireRole(['owner', 'admin', 'agent'])] };
 
   // GET /api/labels  — list workspace labels (optionally with usage counts via ?withUsage=1)
   fastify.get('/', auth, async (request, reply) => {
@@ -27,7 +29,7 @@ export async function labelsRoutes(fastify: FastifyInstance): Promise<void> {
   });
 
   // POST /api/labels  — create { name, color? }
-  fastify.post('/', auth, async (request, reply) => {
+  fastify.post('/', canWrite, async (request, reply) => {
     const { workspaceId } = request.user as { workspaceId: string };
     const { name, color } = request.body as { name?: string; color?: string };
 
@@ -48,7 +50,7 @@ export async function labelsRoutes(fastify: FastifyInstance): Promise<void> {
   });
 
   // PATCH /api/labels/:id  — rename / recolor (cascades a rename across tags arrays)
-  fastify.patch('/:id', auth, async (request, reply) => {
+  fastify.patch('/:id', canWrite, async (request, reply) => {
     const { workspaceId } = request.user as { workspaceId: string };
     const { id } = request.params as { id: string };
     const { name, color } = request.body as { name?: string; color?: string };
@@ -92,7 +94,7 @@ export async function labelsRoutes(fastify: FastifyInstance): Promise<void> {
   });
 
   // DELETE /api/labels/:id  — delete + cascade $pull from conversations & contacts
-  fastify.delete('/:id', auth, async (request, reply) => {
+  fastify.delete('/:id', canWrite, async (request, reply) => {
     const { workspaceId } = request.user as { workspaceId: string };
     const { id } = request.params as { id: string };
 
